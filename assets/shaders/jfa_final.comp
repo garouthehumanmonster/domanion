@@ -1,0 +1,31 @@
+#version 460 core
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = IMG_JFA_IN, rg16f) readonly uniform image2D u_jfa_in;
+layout(binding = TEX_TERRITORY_OWNER) uniform sampler2D u_owner;
+layout(binding = IMG_SDF, rg16f) writeonly uniform image2D u_sdf;
+
+uniform float u_texel_m;
+uniform int u_g;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= u_g || p.y >= u_g) return;
+
+    vec2 s = imageLoad(u_jfa_in, p).xy;
+    vec2 c = vec2(2 * p + 1);
+
+    float dist;
+    if (s.x < 0.0) {
+        dist = 2000.0;
+    } else {
+        vec2 e = s - c;
+        dist = min(sqrt(dot(e, e)) * 0.5 * u_texel_m, 2000.0);
+    }
+
+    int owner = int(texelFetch(u_owner, p >> 1, 0).r * 255.0 + 0.5);
+    float sd = (owner > 0) ? dist : -dist;
+
+    imageStore(u_sdf, p, vec4(sd, float(owner), 0.0, 0.0));
+}

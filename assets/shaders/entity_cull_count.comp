@@ -1,0 +1,104 @@
+#version 460 core
+
+#include "entity_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = BIND_SSBO_INSTANCES) readonly buffer InstancesBlock {
+    EntityInstance b_instances[];
+};
+
+layout(std430, binding = BIND_SSBO_MODELS) readonly buffer ModelsBlock {
+    ModelGpu b_models[];
+};
+
+layout(std430, binding = BIND_SSBO_BUCKETS) buffer RanksBlock {
+    uvec2 b_ranks[];
+};
+
+layout(std430, binding = BIND_SSBO_COUNTERS) buffer CountersBlock {
+    uint b_counters[];
+};
+
+shared uint s_counters[8];
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    if (lid < 8u) {
+        s_counters[lid] = 0u;
+    }
+    barrier();
+
+    uint i = gl_GlobalInvocationID.x;
+    uint inst_count = u_counts.x;
+
+    if (i < inst_count) {
+        uint model_id = b_instances[i].ids & 0xFFFFu;
+
+        if (model_id >= u_counts.y) {
+            // Invalid model
+            atomicAdd(s_counters[0], 1u); // input
+            atomicAdd(s_counters[7], 1u); // invalid
+            b_ranks[i] = uvec2(0xFFFFFFFFu, 0u);
+        } else {
+            atomicAdd(s_counters[0], 1u); // input
+
+            float alpha = u_cam_alpha.w;
+            vec3 pos = mix(b_instances[i].pos_yaw_prev.xyz, b_instances[i].pos_yaw_curr.xyz, alpha);
+            float yaw = lerp_yaw(b_instances[i].pos_yaw_prev.w, b_instances[i].pos_yaw_curr.w, alpha);
+            float scale = b_instances[i].scale;
+
+            vec3 sphere_xyz = b_models[model_id].sphere.xyz;
+            float sphere_r  = b_models[model_id].sphere.w;
+
+            vec3 centre_world = pos + entity_rotate_y(yaw, sphere_xyz * scale);
+            float radius_w    = sphere_r * scale + u_time_p.z;
+
+            // Frustum cull
+            bool inside_frustum = true;
+            for (int p = 0; p < 6; ++p) {
+                float dist = dot(u_planes[p].xyz, centre_world) + u_planes[p].w;
+                if (dist < -radius_w) {
+                    inside_frustum = false;
+                    break;
+                }
+            }
+
+            if (!inside_frustum) {
+                atomicAdd(s_counters[2], 1u); // frustum_culled
+                b_ranks[i] = uvec2(0xFFFFFFFFu, 0u);
+            } else {
+                // Size cull & LOD
+                float dist = length(centre_world - u_cam_alpha.xyz);
+                float px = radius_w * u_cull_p.x / max(dist, 0.001);
+
+                int lod = -1;
+                if (px >= u_cull_p.y) {
+                    lod = 0;
+                } else if (px >= u_cull_p.z) {
+                    lod = 1;
+                } else if (px >= u_cull_p.w) {
+                    lod = 2;
+                }
+
+                if (lod == -1) {
+                    atomicAdd(s_counters[3], 1u); // size_culled
+                    b_ranks[i] = uvec2(0xFFFFFFFFu, 0u);
+                } else {
+                    atomicAdd(s_counters[1], 1u); // visible
+                    atomicAdd(s_counters[4 + lod], 1u); // visible per LOD
+
+                    uint bucket = model_id * 3u + uint(lod);
+                    uint rank = atomicAdd(b_counters[16u + bucket], 1u);
+                    b_ranks[i] = uvec2(bucket, rank);
+                }
+            }
+        }
+    }
+
+    barrier();
+
+    if (lid < 8u) {
+        atomicAdd(b_counters[lid], s_counters[lid]);
+    }
+}

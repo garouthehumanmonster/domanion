@@ -1,0 +1,378 @@
+<USER_REQUEST>
+# GATE 13: Lighting (cascaded shadows, PBR-lite) and world marks (NATO icons, health bars)
+
+This is **Gate 13**. Gate 12 should have ended at T11+20 tests; I haven't seen your output. The prompt's preconditions stop if Gate 12 isn't green and record the real count (T12) to count from.
+
+Three things I can't see from here, so Gemini writes them down first in `docs/gate13_contract_notes.md`:
+- the sun direction sign convention;
+- which target the tonemap writes to;
+- how the 32 icons are laid out in the MSDF atlas.
+
+The tests cross-check each one.
+
+Paste everything in the block below into a **NEW** Antigravity task.
+
+```
+GATE 13 of 30: LIGHTING + WORLD MARKS (4-cascade entity shadows, heightfield terrain shadows, PBR-lite, NATO icons, health bars)
+Project: DOMINION 2026 (ron2026). Read GEMINI.md first. Everything below is already decided.
+Do not redesign. Do not "improve". Build exactly this.
+
+======================================================================
+§0 RULES (same as every gate)
+======================================================================
+R1. Work in the groups A..G below, in order. After EACH group: build Debug AND Release, run the group's
+    check command, and only then continue. Never batch groups.
+R2. NEVER weaken, delete, skip or loosen a test. If a number in this spec is provably impossible,
+    STOP, quote the exact line, fix code AND test with the smallest change, and log it in
+    docs/spec_deviations.md (date, group, quoted line, why impossible, what changed).
+R3. Only the TUNABLES listed in §1 may be adjusted to make a test pass. Nothing else.
+R4. Do NOT modify earlier gates' source except: CMake lists, docs, and the explicitly listed ADDITIVE edits
+    in this prompt. Additive = new functions/enum entries/members/defines; existing behaviour unchanged.
+R5. GL calls only in src/render and tests/render. DSA for create/modify. Allowed non-DSA calls: glBindImageTexture,
+    glMemoryBarrier, glDispatchCompute, glMultiDrawElementsIndirect, glDrawArraysIndirect, glDrawElements*, glBindSampler
+    (with DSA glCreateSamplers/glSamplerParameter*), and state calls (glEnable/glDisable/glDepthFunc/glDepthMask/glColorMask/
+    glCullFace/glFrontFace/glViewport/glBlendFunc...). No glGetError outside tests.
+R6. No GPU allocation after the ledger freezes. Everything allocated in init() goes through VramLedger.
+    glNamedBufferSubData/glClearNamedFramebuffer*/glTextureSubImage* are uploads/clears, NOT allocations: allowed at runtime.
+R7. No heap allocation per frame. Fixed arrays only in per-frame paths.
+R8. ron_tests (GL-free sim tests) must stay EXACTLY as it was. All new tests go in ron_render_tests.
+R9. The sim NEVER reads any lighting/marks structure. Gate 13 does NOT touch src/sim.
+R10. Existing Gate 01..12 tests must keep passing in both builds.
+
+======================================================================
+§1 LOCKED DECISIONS
+======================================================================
+T12 = number of tests ron_render_tests reports BEFORE you change anything (expected T11+20).
+After group X the expected total is T12 + k (k given per group). Final expected = T12 + 22.
+If the number you registered differs from k, list the registered names in your report; a count mismatch alone is not a failure,
+a failing test is.
+
+TUNABLES (the ONLY adjustable things):
+  SHADOW_RES = 2048              (allowed 1024 or 2048)
+  TERRAIN_SHADOW_STEPS = 48      (allowed 24..48)
+Everything else is FIXED, including the cascade count (4) and every threshold in this spec.
+
+--- Lighting constants (src/render/light_types.hpp) ---
+  SHADOW_CASCADES=4, SPLIT_LAMBDA=0.80, SHADOW_NEAR=1.0, SHADOW_DISTANCE=1500.0, CASCADE_Z_UP=700.0, CASCADE_Z_DOWN=400.0,
+  TERRAIN_SHADOW_REACH=1100.0, TERRAIN_SHADOW_BIAS=0.5, ENTITY_FRUSTUM_MARGIN=48.0 (used by ron_view and the lit fixture when entity shadows are on).
+  Ambient defaults: sky (0.38,0.52,0.78), ground (0.20,0.18,0.15), intensity 0.55.
+  Light flags (LightingUbo cam_fwd.w, float-coded integer): bit0 = entity shadows (CSM), bit1 = terrain shadows (height march).
+
+--- L = unit vector from surface TOWARD the sun. Define it once in light_types.hpp: light_to_sun(const FrameUniforms&, float L[3]).
+    Its sign comes from the contract note Q1 (it must match how the Gate 10 terrain shader already uses sun_dir). ---
+
+--- Cascade fit (CPU, cascade_math.cpp; the GLSL consumes only the results) ---
+  splits: z_i = lerp( n+(f-n)*i/4 , n*pow(f/n, i/4) , 0.80 ) for i=0..4, n=1.0, f=1500.0  (z_0=n, z_4=f).
+  View basis from FrameUniforms.view (column-major): right=(v[0],v[4],v[8]), up=(v[1],v[5],v[9]), fwd=-(v[2],v[6],v[10]); eye=cam_pos;
+  tx=1/proj[0], ty=1/proj[5]. Slice corners at depth z: eye + fwd*z +- right*tx*z +- up*ty*z.
+  Cascade c uses z_c..z_{c+1}: C = mean of the 8 corners, R = max |corner-C|, then R = ceil(R*16)/16.
+  Light basis: upref = (|L.y|<0.99) ? (0,1,0) : (0,0,-1); r = normalize(cross(upref,L)); u = cross(L,r)   [(r,u,L) is right-handed; light looks along -L].
+  cx=dot(r,C), cy=dot(u,C), cz=dot(L,C); T=2R/SHADOW_RES; cx=floor(cx/T+0.5)*T; cy=floor(cy/T+0.5)*T.
+  zn_v=cz+R+700, zf_v=cz-R-400, range=zn_v-zf_v (=2R+1100), inv_range=1/range.
+  light_vp rows (column-major storage): row0=(r/R, -cx/R), row1=(u/R, -cy/R), row2=(L/range, -zf_v/range), row3=(0,0,0,1)
+  i.e. x_ndc=(dot(r,p)-cx)/R, y_ndc=(dot(u,p)-cy)/R, z_ndc=(dot(L,p)-zf_v)/range.  REVERSE-Z: z_ndc=1 is nearest the sun.
+  texel_world = T. cascade_select(depth) = first c with depth < z_{c+1}, else -1 (beyond = no entity shadow).
+  Receivers: view_depth = dot(world_pos - cam_pos, cam_fwd).
+
+--- Shadow map ---
+  One GL_TEXTURE_2D_ARRAY, 4 layers, SHADOW_RES², D32F. Sampler state on the texture: LINEAR, GL_TEXTURE_COMPARE_MODE=COMPARE_REF_TO_TEXTURE,
+  COMPARE_FUNC=GL_GEQUAL (lit iff ref >= stored), CLAMP_TO_BORDER with border 0. Cleared to 0.0 (reverse-Z). 64 MiB at 2048.
+  Shadow pass state: depth test GL_GREATER, depth write on, GL_DEPTH_CLAMP enabled, no face culling, colour mask off, no polygon offset,
+  viewport SHADOW_RES², one pass per cascade (glNamedFramebufferTextureLayer, then clear depth to 0). Restore ALL state afterwards.
+  Shadow pass draws the camera-visible entity list from the Gate 12 cull (same indirect buffer, visible list, 4 multi-draws).
+  Shadow vertex shader: skin with VAT frame f0 ONLY (no blend); early-out (write gl_Position=vec4(2,2,2,1)) when the instance bounding sphere
+  (centre_world, radius_w as in the cull rule) lies outside the cascade box in light xy: |x_ndc|-r_ndc > 1 or |y_ndc|-r_ndc > 1 with r_ndc=radius_w/R.
+  Receiver lookup (shadow_common.glsl, csm_visibility):
+    c=cascade_select(depth); if c<0 -> 1.0. p = world_pos + N*(texel_world[c]*2.0). clip = light_vp[c]*vec4(p,1).
+    uv = clip.xy*0.5+0.5; if uv outside [0,1] -> 1.0. ref = clip.z + texel_world[c]*1.5*inv_range[c].
+    PCF: 3x3 taps spaced exactly one texel apart of hardware-compared samples (sampler2DArrayShadow), averaged (/9).
+    If c==3: vis = mix(vis, 1.0, smoothstep(0.85*z_4, z_4, depth)).
+
+--- Terrain height-march shadow (shadow_common.glsl terrain_shadow(); CPU reference terrain_shadow_ref MUST be literally identical) ---
+  Inputs world (x,y,z), L, N=TERRAIN_SHADOW_STEPS. If L.y <= 0.01 return 0. lxz=length(L.xz); if lxz<1e-4 return 1.
+  tanE=L.y/lxz; dir=L.xz/lxz. For i=1..N: d=TERRAIN_SHADOW_REACH*pow(i/N,1.5); q=xz+dir*d; h=RON_HEIGHT_MIN+RON_HEIGHT_RANGE*bilinear_height(q);
+  h_ray=y+TERRAIN_SHADOW_BIAS+d*tanE; pen=0.05*d+0.75; o_i=clamp((h-h_ray)/pen+0.5,0,1); occ=max(occ,o_i).  Return 1-occ.
+  (Shader may early-exit when occ>=1; result identical.) Height texture: the Gate 10 R16 texture bound to unit TEX_HEIGHT_LINEAR with its OWN
+  linear/clamp sampler object (glBindSampler); uv=xz/4096 (texel centres at (i+0.5)*cell, matching HeightSampler). q is clamped to [0,4096].
+  Visibility used by lit shaders: vis = (flag0 ? csm_visibility : 1) * (flag1 ? terrain_shadow : 1).
+
+--- PBR-lite (pbr_lite.glsl; CPU twin pbr_ref.cpp; formulas FIXED and literally mirrored) ---
+  pbr_shade(albedo, rough, metal, ao, N, V, L, sun_rgb, vis, sky, ground, sky_i):
+   rc=clamp(rough,0.04,1); a=rc*rc; a2=a*a; NL=clamp(dot(N,L),0,1); NV=max(dot(N,V),1e-4); H=normalize(L+V); NH=clamp(dot(N,H),0,1); VH=clamp(dot(V,H),0,1);
+   D=a2/(PI*sqr(NH*NH*(a2-1)+1)); Vis=0.5/max(NL*sqrt(NV*NV*(1-a2)+a2)+NV*sqrt(NL*NL*(1-a2)+a2),1e-5);
+   F0=mix(vec3(0.04),albedo,metal); F=F0+(1-F0)*pow(1-VH,5);
+   diffuse=(1-F)*(1-metal)*albedo*NL; spec=D*Vis*F*NL*PI;        (sun_rgb is irradiance/PI; this matches the old Lambert scale)
+   direct=(diffuse+spec)*sun_rgb*vis.
+   hemi(n)=mix(ground,sky,n.y*0.5+0.5)*sky_i;   amb_diff=albedo*(1-metal)*hemi(N)*ao;
+   envBRDF (Karis): c0=(-1,-0.0275,-0.572,0.022), c1=(1,0.0425,1.04,-0.04); r=rc*c0+c1; a004=min(r.x*r.x,exp2(-9.28*NV))*r.x+r.y;
+   AB=vec2(-1.04,1.04)*a004+r.zw; amb_spec=(F0*AB.x+AB.y)*hemi(reflect(-V,N))*ao.
+   return direct+amb_diff+amb_spec.   (emissive, team colour, hit flash, fog are applied by the callers, not here.)
+  Terrain: albedo (sRGB array, hw decode), rough = rh.G, metal 0, ao 1. Entities: ORM (R=AO,G=rough,B=metal), team colour mix 0.30 as in Gate 12.
+
+--- Marks (icons + bars) ---
+  Drawn AFTER the tonemap, into the same LDR target the tonemap wrote (contract note Q3), no depth test/write, blend src_alpha/one_minus_src_alpha.
+  Colours are display-space, written directly (no sRGB conversion).
+  px = projected sphere radius in pixels, exactly the Gate 12 formula: radius_w*proj_scale_px/max(dist,0.001). centre_world/radius_w as in the cull rule (alpha-interpolated).
+  mark cull (marks_cull_reference; mirrored by marks_cull.comp): invalid model -> neither. Frustum test with margin 0 (ignore EntityUbo time_p.z) -> neither.
+    icon iff model_marks[model] != 0xFFFF AND px < ICON_ON_PX(20).     bar iff px >= BAR_MIN_PX(3) AND ( (hp>0 AND hp<0.999) OR flags&FLAG_SELECTED ).
+    ambiguous = a plane value within +-0.05 of 0, or px within 0.2% of 20 or 3.
+  icon_alpha(px) = 1 - smoothstep(ICON_OFF_PX(8), ICON_ON_PX(20), px).
+  Icon quad: screen-aligned square, side = 28*ui_scale px, centred on the projected centre_world. Local coords p in [-0.5,0.5]^2 (x right, y DOWN the screen).
+    shape ids: 0 ground = box half-size (0.46,0.34); 1 air = upper semicircle (circle radius 0.46 centred (0,+0.10), clipped to y <= +0.34... i.e. flat edge at the bottom);
+    2 naval = circle radius 0.40; 3 building = box half-size (0.38,0.38); 4 other = same as ground.  Frame is an SDF with 1 fwidth antialias.
+    fill = mix(owner_colour, white, 0.35) at alpha 0.92*icon_alpha; border 1.5 px*ui_scale of (0.04,0.04,0.05) alpha icon_alpha;
+    glyph = MSDF icon (median(rgb), RANGE_PX=4, screenPxRange = max(RANGE_PX*glyph_px/64, 1) where glyph_px = 0.56*28*ui_scale) in (0.04,0.04,0.05), drawn in the centre
+    square |p| <= 0.28 (a 0.56 wide square).  Orientation of the glyph follows the atlas contract (note Q4): image row 0 = TOP.
+  Bar: radius_px = radius_w*proj_scale_px/dist; w = clamp(2*radius_px, 14, 64)*ui; h = 4*ui; anchor (px,py from TOP) = projected centre_world;
+    bar_cy = py - (radius_px + 8*ui); rect x in [px-w/2, px+w/2], y in [bar_cy-h/2, bar_cy+h/2]; 1*ui px outline outside the rect, colour (0,0,0) alpha 1.
+    Background (0.05,0.05,0.05) alpha 0.85. Fill from the left, fraction clamp(hp,0,1), opaque, colour bar_color(hp):
+    hp>=0.5 ? mix(YELLOW,GREEN,(hp-0.5)*2) : mix(RED,YELLOW,hp*2); RED=(0.90,0.15,0.12) YELLOW=(0.95,0.85,0.15) GREEN=(0.20,0.85,0.25).
+  Icon mapping (icon_map.cpp; decision made by YOU in note Q8): per model {icon index 0..31 or 0xFFFF=none, shape 0..4}.
+    Categories prop/resource/projectile -> none (0xFFFF). air -> shape 1, naval -> shape 2, building -> shape 3, everything else shape 0.
+    Icon choice by model-name keywords then category default; write the full table (71 rows) to docs/gate13_contract_notes.md.
+
+--- Binding defines (add to the X-macro; uniqueness within each category; Gate 09 uniqueness test must pass) ---
+  Existing: UBO 0..4; SSBO 0..10; TEX 0..18 (12,13 fog targets; 14 VAT; 15..18 trims); IMG 0..4.
+  New: BIND_UBO_LIGHT=5, BIND_UBO_MARKS=6; BIND_SSBO_ICONS=11, BIND_SSBO_BARS=12, BIND_SSBO_MARK_CMDS=13, BIND_SSBO_MODEL_MARKS=14;
+       TEX_SHADOW_MAP=19, TEX_HEIGHT_LINEAR=20, TEX_MSDF=21.
+  Also inject: RON_LIT (0 default), RON_SHADOW_CASCADES, RON_TERRAIN_SHADOW_STEPS, RON_TERRAIN_SHADOW_REACH, RON_TERRAIN_SHADOW_BIAS.
+NEW ProgramIds: ShadowEntity (vertex-only), TerrainLit, TerrainLitOvl, EntityLit, EntityLitOvl, MarksCull, IconDraw, BarDraw, ShadowSelfTest, PbrSelfTest.
+  TerrainLit/TerrainLitOvl compile the EXISTING Gate 10 terrain shaders with RON_LIT=1 (Ovl adds RON_OVERLAYS=1). EntityLit/EntityLitOvl compile the Gate 12 entity
+  shaders with RON_LIT=1 (Ovl adds RON_OVERLAYS=1). With RON_LIT=0 (all existing programs) the files compile to exactly what they did. Ocean is NOT lit-changed.
+
+Buffers / structs (light_types.hpp, static_asserts on sizeof/offsetof/trivially_copyable):
+  LightingUbo std140, 368 B: mat4 light_vp[4] (256); vec4 splits{z_1,z_2,z_3,z_4}; vec4 texel{texel_world[4]}; vec4 inv_range{4}; vec4 cam_fwd{xyz, flags};
+                             vec4 ambient_sky{rgb,intensity}; vec4 ambient_ground{rgb,0}; vec4 shadow_p{1.0 (pcf radius texels), TERRAIN_SHADOW_STEPS, TERRAIN_SHADOW_REACH, 0}.
+  MarksUbo std140, 832 B: vec4 icon_p{20, 8, 28, ui_scale}; vec4 bar_p{14, 64, 4, 3}; vec4 screen{w,h,1/w,1/h}; vec4 atlas{atlas_w, atlas_h, 4, 0};
+                          vec4 owner_color[16] (from overlay_palette(), alpha 1); vec4 icon_uv[32] {u0,v0,u1,v1}.
+  Mark commands buffer: 8 uints = two DrawArraysIndirectCommand {count=6, instanceCount, first=0, baseInstance=0}: icons at uint 0..3, bars at uint 4..7.
+  Icon list and bar list: uint per entry (instance index), capacity MAX_INSTANCES each. Model marks SSBO: uint per model = icon | (shape<<16)  (0xFFFF in the low half = none), 128 entries.
+
+VRAM: ShadowMaps <= 80 MiB, UiAtlas <= 4 MiB, EntityBuffers delta <= 2 MiB. Total stays <= 2304 MiB.
+
+ADAPTER RULE: only ui_source.cpp may include texture_data.hpp for the MSDF/UI atlas (terrain_source.cpp and entity_source.cpp stay the others).
+
+ADDITIVE EDITS to earlier gates (the complete list; nothing else may change):
+  E1. Gate 12 cull shader entity_cull_count.comp and entity_cull_reference: frustum test uses (radius_w + ubo.time_p.z). time_p.z is 0 in every Gate 12 test, so behaviour is unchanged.
+  E2. EntityRenderer: set_frustum_margin(float) (writes time_p.z after entity_fill_ubo), set_lighting(LightingSystem*), draw_shadow_cascade(int), getters needed by marks
+      (instance buffer + current range, entity ubo buffer, indirect/visible buffers if not yet exposed).
+  E3. TerrainRenderer: set_lighting(LightingSystem*) (selects TerrainLit / TerrainLitOvl, calls lighting->bind_lit_pass(height_tex) before draw_terrain); height texture getter if missing.
+  E4. Terrain fragment shader and entity fragment shader: the placeholder lighting block is wrapped #if RON_LIT / #else (old code untouched) / #endif.
+  E5. shader system: support vertex-only programs and (if missing) loose uniforms, additively.
+
+GEMINI.md addition (append, one paragraph; ALSO edit the adapter sentence to: "Only terrain_source.cpp, entity_source.cpp and ui_source.cpp may include theatre_data.hpp/texture_data.hpp/model_data.hpp from src/render"):
+"Lighting: L = unit vector surface->sun. Entity shadows = 4 stabilised cascades (2048^2 D32F array, reverse-Z, compare GEQUAL, PCF 3x3); terrain shadows = 48-step height march in the
+shader (terrain does not render into the shadow map). PBR-lite is the single lighting function in pbr_lite.glsl with a literal CPU twin in pbr_ref.cpp; lit programs are TerrainLit*/EntityLit* (RON_LIT=1).
+Marks (NATO icons below 20 px, health bars) are compute-culled lists drawn after the tonemap with glDrawArraysIndirect. Frame order: overlays -> entity cull -> lighting update -> shadow pass ->
+HDR clear -> terrain -> entities -> ocean -> tonemap -> icons -> bars -> minimap/UI. Contracts: docs/render_contracts.md and docs/gate13_contract_notes.md."
+
+======================================================================
+§2 PRECONDITIONS (before any code)
+======================================================================
+P1. Build Debug and Release (the two build dirs in GEMINI.md). Run ron_tests and ron_render_tests (both builds) and the Gate 08 python selftest (ALL GROUPS PASS (35/35)).
+    Run ./ron_view --hidden --frames 30 --crowd 3000 (must exit 0). Confirm models_2026.mdbin, textures_2026.tex26, continent_2026.thtr exist (run the bakers per GEMINI.md if not).
+P2. Write docs/gate13_baseline.txt:  T_SIM=<ron_tests count>  T12=<ron_render_tests count>  PY08=35
+P3. If anything fails: STOP and report the first failing test with file:line plus the last 30 lines. Write no code.
+P4. Read (do not edit): gl_bindings.hpp, the program registry, gpu_buffer/gpu_texture, frame_fill + FrameUniforms, terrain_renderer.*, entity_renderer.*, entity_math.*, entity_source.cpp,
+    the Gate 10 terrain fragment shader and the Gate 12 entity fragment shader (lighting block, sun use, fog), the tonemap pass and how ron_view / the Gate 12 fixture reach the LDR target,
+    tests/render/entity_fixture.hpp, scene_fixture.*, texture_data.hpp, docs/asset_contracts.md (MSDF atlas section), overlay_types.hpp (overlay_palette).
+P5. Runtime-check GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS >= 15 (in test Lit_Layout).
+
+======================================================================
+GROUP A: contract notes, types, CPU math  -> k=6, total T12+6
+======================================================================
+A0. BEFORE CODING write docs/gate13_contract_notes.md answering, with the file:line that proves each:
+  Q1 sun_dir sign: does FrameUniforms.sun_dir point TOWARD the sun or along the light's travel? Which line of the terrain fragment shader proves it? Define light_to_sun() accordingly.
+  Q2 sun_color scale and the numeric defaults frame_fill produces for sun_dir/sun_color.
+  Q3 Which render target does the tonemap pass write (default framebuffer or an offscreen LDR target)? Is it sRGB-converting (must not be)? How do the Gate 10/12 test helpers read it back,
+     and is the readback image row 0 = top or bottom? Where exactly will icons/bars draw?
+  Q4 MSDF atlas icon layout: the 32 icon indices -> names, pixel rect (x,y,w,h) in the 1024x512 atlas, UV rect, whether v increases downward (row 0 = image top), what R,G,B,A hold, and the decode
+     formula the contract prescribes. Quote docs/asset_contracts.md and TextureData accessors.
+  Q5 Terrain fragment shader: variable names for normal, albedo, roughness, final colour; the line range of the placeholder lighting; the filter/format of the height texture and its GLuint accessor.
+  Q6 Entity fragment shader: same.
+  Q7 The two exact signatures you will call: TerrainRenderer::draw_terrain/draw_ocean and the Gate 12 fixture's render helper.
+  Q8 The 71 model names + categories, and your icon/shape table (DECISION entries allowed).
+  If an answer is not derivable, choose the simplest consistent option and mark it DECISION.
+
+Files:
+ src/render/light_types.hpp   constants, LightingUbo, MarksUbo, light_to_sun(), set_sun(FrameUniforms&, elev_deg, az_deg) (azimuth 0=north(-Z), 90=east(+X); sets sun_dir per Q1), static_asserts.
+ src/render/cascade_math.hpp/.cpp   struct CascadeSet {float split[5]; float light_vp[4][16]; float texel_world[4]; float inv_range[4]; float radius[4]; float centre_ls[4][3];}
+   cascade_splits(n,f,lambda,out[5]); cascade_fit(const FrameUniforms&, const float L[3], int res, CascadeSet*); int cascade_select(const CascadeSet&, float view_depth).
+   Also lighting_fill_ubo(const CascadeSet&, const FrameUniforms&, flags, LightingUbo*).
+ src/render/shadow_ref.hpp/.cpp   float terrain_shadow_ref(const HeightSampler&, float x,float y,float z, const float L[3], int steps);
+ src/render/pbr_ref.hpp/.cpp      float-vector twin of pbr_shade (§1), plus the pieces: ggx_d, smith_vis, fresnel_schlick.
+ src/render/marks_math.hpp/.cpp   struct MarksCullResult{bool icon,bar,ambiguous;}; marks_cull_reference(inst, models, model_marks, entity_ubo); float icon_alpha(float px);
+   struct BarRect{float x0,y0,w,h;}; BarRect bar_layout(float centre_px,float centre_py,float radius_px,float ui); void bar_color(float hp,float out[3]).
+ src/render/icon_map.hpp/.cpp     struct ModelMark{u16 icon; u8 shape;}; build_model_marks(const ModelCpu*,int count,ModelMark*); the keyword rules.
+ src/render/ui_source.hpp/.cpp    THE adapter: MSDF atlas pixels (RGBA8 1024x512), the 32 icon UV rects, icon names. Clear failure message if the asset is missing.
+ Tests (tests/render/test_light_cpu.cpp; register all):
+  1 Lit_Layout: sizeof(LightingUbo)==368, MarksUbo==832, offsets of every member; new binding defines exist with §1 values; GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS >= 15;
+    constants equal §1 literals.
+  2 Cascade_Splits: splits(1,1500,0.8) equal the formula within 1e-4; strictly increasing; split[0]==1, split[4]==1500; cascade_select at exactly each boundary and 0.5/1499.9/1500.1 (-1).
+  3 Cascade_Fit: fixture camera (focus = first land site, dist 300, yaw 0.4) and sun elevation 40 deg azimuth 135 (via set_sun). For each cascade: all 8 slice corners map to |x_ndc|,|y_ndc| <= 1+1.5/SHADOW_RES+1e-3
+    and z_ndc in [-1e-3, 1+1e-3]. centre_ls x and y are integer multiples of texel_world (within 1e-3 texel). radius[] strictly increasing. A SECOND camera (focus moved 777 m, dist 90, yaw 2.0, pitch from
+    the camera model) yields radius[c] identical to the first within 1e-4 for all c (the slice shape is pose independent), and its light_vp differs. texel_world == 2*radius/SHADOW_RES.
+  4 Shadow_Ref: on the fixture HeightSampler over 3000 deterministic land points (height >= 2 m, y = height): (a) L=(0,1,0): all results == 1. (b) L.y = 0.005: all == 0. (c) for sun elevations
+    {60,30,15,8,4} deg the shadowed fraction (result < 0.5) is non-decreasing, at 4 deg it is >= 3% and <= 95%. (d) result always in [0,1] and finite. (e) raising y by 50 m never decreases the result.
+  5 Pbr_Ref: (a) ggx_d integrates: sum over a fine hemisphere grid of D*cos(theta_h) dOmega within 1% of 1 for roughness 0.3, 0.6, 1.0. (b) fresnel at VH=1 equals F0, at VH=0 equals 1.
+    (c) pbr_shade is finite and >= 0 over 20000 random inputs. (d) doubling sun_rgb exactly doubles the direct part (compute with vis=1 and ambient intensity 0 vs 2x); vis=0 removes it entirely;
+    (e) ao scales the ambient part linearly; (f) metal=1 gives zero diffuse term (albedo (1,1,1), sky_i 0, compare with spec-only expectation within 1e-5); (g) result is monotone non-decreasing in NL
+    for fixed other inputs along a 64-step sweep of L from grazing to normal incidence at metal=0 rough=1.
+  6 Marks_Math: icon_alpha(20)==0, (>=20)==0, (<=8)==1, monotone between; bar_color(1)==GREEN, (0.5)==YELLOW, (0)==RED exactly (1e-6); bar_layout width clamps to 14 and 64;
+    marks_cull_reference on hand-built instances: tiny far visible unit -> icon, no bar; damaged (hp 0.4) mid unit px 30 -> bar, no icon; selected hp 1 -> bar; hp 0 unselected -> no bar;
+    hp 1 unselected -> no bar; behind the camera -> neither; invalid model -> neither; a prop/resource/projectile model -> never an icon. icon_map: EVERY model has icon < 32 or 0xFFFF and shape <= 4;
+    prop/resource/projectile are 0xFFFF; air models have shape 1; naval 2; building 3. ui_source: all 32 icon UV rects satisfy 0<=u0<u1<=1, 0<=v0<v1<=1, u1-u0 within 0.001 of 64/1024, v1-v0 within 0.001 of 64/512;
+    no two rects overlap. Print the icon table and the number of models per icon.
+CHECK A: build both; ron_render_tests (both builds) -> T12+6 pass; ron_tests count unchanged.
+
+======================================================================
+GROUP B: GPU resources  -> k=3, total T12+9
+======================================================================
+ src/render/ui_atlas.hpp/.cpp   class UiAtlas { bool init(VramLedger&); GLuint tex(); u64 vram_bytes(); void shutdown(); }  RGBA8 1024x512, LINEAR, CLAMP_TO_EDGE, one level, ledger category UiAtlas.
+ src/render/lighting_system.hpp/.cpp (resources + CPU update now; passes in group C/D)
+   struct LightFlags{bool entity_shadows=true, terrain_shadows=true;};
+   bool init(VramLedger&, int shadow_res = SHADOW_RES);   // shadow array (ShadowMaps), FBO with layered attachment helper, LightingUbo buffer (EntityBuffers), a linear/clamp sampler object for TEX_HEIGHT_LINEAR
+   void update(const FrameUniforms&, const LightFlags&);  // cascade_fit + lighting_fill_ubo + glNamedBufferSubData
+   const CascadeSet& cascades() const; GLuint shadow_tex(); GLuint ubo(); u64 vram_bytes(); void shutdown();
+ src/render/marks_renderer.hpp/.cpp (resources now)   class MarksRenderer
+   bool init(VramLedger&, UiAtlas&, const ModelCpu* models, int model_count);  // icon list, bar list (EntityBuffers), cmd buffer (32 B, initialised {6,0,0,0,6,0,0,0}), model marks SSBO, MarksUbo
+   void update_ubo(int screen_w,int screen_h,float ui_scale);   // fills MarksUbo (palette, icon_uv, params) with glNamedBufferSubData
+   u64 vram_bytes(); GLuint cmd_buffer(), icon_list(), bar_list(); void shutdown();
+ Tests (tests/render/test_light_gpu.cpp), each with its OWN local unfrozen ledger:
+  7 Lit_ShadowResources: LightingSystem::init: shadow texture target is GL_TEXTURE_2D_ARRAY, 4 layers, SHADOW_RES, internal format GL_DEPTH_COMPONENT32F; compare mode == COMPARE_REF_TO_TEXTURE, func == GL_GEQUAL;
+     the FBO attaches (glCheckNamedFramebufferStatus == complete) for every layer; after a clear to 0.0 a 64x64 readback of layer 3 is all 0.0; vram_bytes == 4*res*res*4 EXACTLY; ledger delta equals the sum
+     of vram_bytes of the new objects; ShadowMaps delta <= 80 MiB. After update() with the fixture camera the LightingUbo readback equals lighting_fill_ubo byte-exact.
+  8 Ui_AtlasUpload: UiAtlas::init; the 64x64 texel region of icon 0 and of icon 31 read back (GL_RGBA/GL_UNSIGNED_BYTE) equals the tex26 bytes exactly; vram_bytes == 2097152; UiAtlas ledger delta == that.
+  9 Marks_Resources: MarksRenderer::init + update_ubo(640,360,1): cmd buffer readback == {6,0,0,0,6,0,0,0}; model marks SSBO equals build_model_marks output byte-exact; MarksUbo readback equals the CPU struct
+     byte-exact (palette entries 1,2 exact, icon_uv[0..31] exact); ledger delta equals vram_bytes() sum; EntityBuffers delta <= 2 MiB.
+CHECK B: build both; ron_render_tests -> T12+9 pass.
+
+======================================================================
+GROUP C: shader library, shadow pass, GPU twins  -> k=3, total T12+12
+======================================================================
+ shaders/shadow_common.glsl   LightingBlock (UBO BIND_UBO_LIGHT), sampler2DArrayShadow u_shadow_map (TEX_SHADOW_MAP), sampler2D u_height_lin (TEX_HEIGHT_LINEAR), cascade_select, csm_visibility, terrain_shadow,
+                              shadow_visibility(world_pos, N, flags). All behind #if RON_LIT. Formulas exactly as §1.
+ shaders/pbr_lite.glsl        pbr_shade exactly as §1.
+ shaders/shadow_entity.vert   includes entity_common.glsl; reads visible list like entity_draw.vert; u_cascade loose uniform; VAT frame f0 only; early-out per §1; vertex-only program.
+ shaders/shadow_selftest.comp (local_size 64): in SSBO BIND_SSBO_TEST_IN vec4 points (x,y,z,0); loose uniform u_L (vec3); out SSBO BIND_SSBO_TEST_OUT float terrain_shadow(). LightingBlock not required there.
+ shaders/pbr_selftest.comp   (local_size 64): in SSBO: per input 24 floats {albedo3, rough, metal, ao, N3, V3, L3, sun3, vis, sky3, ground3, sky_i} ... (you choose the packing but write it in the test header); out SSBO vec4 {rgb,0}.
+ EntityRenderer::draw_shadow_cascade(int c) (E2) and LightingSystem::render_shadows(EntityRenderer&): for c in 0..3: bind FBO layer c, viewport, clear depth 0, program ShadowEntity,
+   upload u_cascade, bind LightingUbo/EntityUbo/instance ring/visible/model SSBOs/VAT/VAO/indirect, one glMultiDrawElementsIndirect, then restore state. If the entity-shadow flag is off render_shadows only clears the 4 layers.
+ Also apply additive edit E1 now and re-run all Ent_* and Cull_* tests.
+ Tests (tests/render/test_shadow_gpu.cpp):
+  10 Shadow_TerrainGpu: terrain height texture from the Gate 10 fixture bound to TEX_HEIGHT_LINEAR with the LightingSystem sampler. 4096 deterministic land points (y = height + {0 or 3 m}), L from the first elevation in
+     {8,14,22} deg (azimuth 135) whose CPU shadowed fraction is >= 3% (fail only if none). GPU result vs terrain_shadow_ref: >= 98% of points within 0.03, ALL within 0.35. Print the percentage.
+     At least 3% of points have ref < 0.5.
+  11 Pbr_Gpu: 2048 deterministic inputs (unit vectors random, rough 0..1, metal 0..1, ao 0..1, sun colour 0..4, vis 0..1, palette defaults) GPU vs CPU: every channel |gpu-cpu| <= 2e-3*|cpu| + 1e-4.
+  12 Shadow_CascadeDepth: fixture camera focus = first land site, dist 300 yaw 0.4, sun elev 45 az 135; one instance of the first vehicle model at the focus (scale chosen so radius_w = 0.05*dist, alpha 0, hp 0).
+     Render the entity cull then LightingSystem::update + render_shadows. Read back all 4 depth layers. For each cascade project the instance centre_world with light_vp: if |x_ndc|,|y_ndc| <= 0.8
+     then layer c must contain >= 50 texels > 0; if either exceeds 1+radius_ndc+0.05 then layer c must contain 0 texels > 0. At least one cascade must fall in each category (print which). All values in [0,1].
+CHECK C: build both; ron_render_tests -> T12+12 pass. Re-run the full Gate 12 entity tests.
+
+======================================================================
+GROUP D: lit integration  -> k=5, total T12+17
+======================================================================
+ Edits E3/E4: shaders: in terrain frag and entity frag wrap the placeholder lighting with #if RON_LIT: gather inputs per Q5/Q6, v = shadow_visibility(...), colour = pbr_shade(...) with sun_dir/sun_color/ambient from the
+   frame/lighting UBOs (L via the Q1 convention), then everything after (emissive, team colour, hit flash, atmospheric fog, overlays) stays in its existing order. With RON_LIT=0 nothing changes.
+   Entity: emissive adds albedo*e*2.0 as before; terrain: no emissive.
+ TerrainRenderer::set_lighting / EntityRenderer::set_lighting select TerrainLit(Ovl)/EntityLit(Ovl). When lighting == nullptr: Gate 10/11/12 behaviour byte for byte.
+ tests/render/lit_fixture.hpp (do NOT edit the older fixtures): renders the full frame in the §1 frame order with options {focus, dist, yaw, sun elev/az/colour override (via set_sun and writing sun_color after frame_fill),
+   LightFlags, marks on/off, overlays on/off, entity list}, returns the LDR colour image and a depth image, plus the frame matrices. Document the real helper names in the file header.
+   Test sun for all D/E tests: elevation as stated, azimuth 135, sun_color (3.0,2.85,2.55), ambient defaults.
+ Tests (tests/render/test_lit_scene.cpp), 640x360 hidden window, fixture focus = first land site, overlays off:
+  13 Lit_Programs: every new ProgramId compiles and links in Debug and Release; the binding defines (TEX_SHADOW_MAP etc.) appear in the injected preamble; a plain Gate 10 render (lighting null) is byte-identical
+     to the same render made through the lit fixture with lighting null and marks off.
+  14 Shadow_Entity_Cascades: for c in 0..3 use dist D_c = {40, 130, 300, 800}[c]; entity = a ground-category model (first vehicle), alpha 0, hp 0, scale so radius_w = 0.06*D_c, at the focus; sun elevation 45.
+     Choose from the LOD0 triangles (entity_source CPU data, VAT frame 0 Idle, world-transformed) the triangle of MAXIMUM area; centroid G; shadow point S = ray from G along -L marched down onto the terrain
+     (HeightSampler, 0.25 m steps up to 600 m; first point with y <= height). Render A = entity shadows ON (terrain shadows OFF, no entity marks) and B = entity shadows OFF, same camera. For yaw in {0,90,180,270} deg
+     take the first view where S projects on screen AND the depth readback at S's pixel is within max(2 m, 0.5% of D_c) of S (not occluded by the entity); fail only if none of 4 works.
+     At S: 3x3 pixel block mean luminance (0.299R+0.587G+0.114B, 0..255) of A <= 0.80 * that of B. Also at the four image corners |A-B| <= 1 per channel. Print the cascade index CPU-selected for S (must equal c in info output;
+     mismatch is only logged).
+  15 Shadow_NoAcne: sun elevation 55; for 6 models (first infantry, first vehicle, first air, first naval, first building, last vehicle) at the focus with radius_w = 0.05*dist (dist 150, yaw 0.4, alpha 0):
+     entity pixels = pixels that differ (> 2 levels) between entity-on and entity-off renders (both with terrain shadows OFF and entity shadows OFF). Mean luminance of those pixels with entity shadows ON must be >= 0.75 * with OFF,
+     and >= 40 entity pixels must exist.
+  16 Shadow_Terrain_Scene: sun_color as above; elevation from the first of {10,15,22,30} deg whose CPU search (over land points on a 128 m lattice with height in [5,250]) finds a point P with terrain_shadow_ref <= 0.05 AND
+     a point Q within 600 m with terrain_shadow_ref >= 0.99, P and Q both with terrain normal dot L >= 0.15 (normal by central differences over +-4 m). Camera focus P, dist 150; then focus Q. Render terrain shadows ON vs OFF (entity shadows OFF, no entities):
+     at the screen centre 5x5 block: for P the luminance(ON) <= 0.97*luminance(OFF) AND (OFF-ON) >= 2 levels; for Q |ON-OFF| <= 2 levels. If no such pair exists on the real continent for any listed elevation, STOP and report (do not relax).
+  17 Shadow_FlagsNeutral: sun elevation 40; entity shadows ON (terrain shadows OFF), NO entities, vs both OFF: mean abs difference <= 0.25 per channel, max <= 3. Also the ON image has mean luminance in [8,247] and std >= 6.
+CHECK D: build both; ron_render_tests -> T12+17 pass. Re-run every Gate 10/11/12 render test (they are in the total).
+
+======================================================================
+GROUP E: marks (icons and bars)  -> k=3, total T12+20
+======================================================================
+ shaders: marks_cull.comp (local_size 64; one thread per instance; reads instance ring, EntityUbo, models SSBO, model marks SSBO, MarksUbo; counts exactly per §1 and appends with
+          atomicAdd on cmd[1] (icons) and cmd[5] (bars) into the lists), icon_draw.vert/.frag, bar_draw.vert/.frag (instance index = list[gl_InstanceID]; 6 vertices per instance generated from gl_VertexID).
+ MarksRenderer::cull(const EntityRenderer&, ...)   // uploads the constant cmd array {6,0,0,0,6,0,0,0} with glNamedBufferSubData, dispatch ceil(count/64), barrier(SHADER_STORAGE|COMMAND)
+ MarksRenderer::draw_icons()/draw_bars()  // blending on, depth test off, glDrawArraysIndirect(GL_TRIANGLES, offset 0 / 16); restore state; binds UiAtlas to TEX_MSDF
+ MarksRenderer::read_counts_blocking(u32* icons,u32* bars)  // tests/exit only
+ Tests (tests/render/test_marks_gpu.cpp):
+  18 Marks_CullGpu: N=20000 instances (the Gate 12 generator; hp random in [0,1], 25% hp exactly 1, 5% hp 0, 5% FLAG_SELECTED, random models, camera dist 300). GPU icon/bar lists vs marks_cull_reference:
+     for every NON-ambiguous instance membership in each list matches exactly; ambiguous <= 0.3% of N; no duplicate ids in either list; icons >= 200 and bars >= 200; list sizes equal the cmd instanceCount fields.
+     An N=0 run leaves both instanceCounts 0.
+  19 Marks_IconPixels: first ground-shape (shape 0) model with an icon; one instance at the focus, alpha 0, hp 0, owner 2, scale so px radius = 5 (use the real proj_scale_px and sphere.radius), camera dist 300 yaw 0, sun elev 45,
+     lighting on. Render with marks ON and OFF. Let cp = projected centre_world in pixels (y from top). Require: (a) in the 28x28 px box around cp at least 45% of pixels differ by > 10 levels;
+     (b) at pixels floor(cp)+(+9.8,+6.0) and +(-9.8,-6.0) (offsets in px, y down): colour within 10 levels per channel of 0.92*mix(palette[2],white,0.35)*255 + 0.08*OFF-pixel;
+     (c) every pixel OUTSIDE the box cp +-16 px is IDENTICAL (diff 0) between ON and OFF; (d) repeat with scale for px radius = 25 (icon_alpha 0): the ON image equals the OFF image exactly everywhere.
+  20 Marks_BarPixels: same set-up but px radius = 30, hp 0.25, not selected, owner 1. Bar rect from bar_layout (ui 1). Pixel at (x0+0.1w, row floor(bar_cy)): within 12 levels of bar_color(0.25)*255.
+     Pixel at (x0+0.9w, same row): within 8 levels of 0.85*0.05*255 + 0.15*OFF-pixel per channel. Every pixel outside the rect expanded by 3 px is identical (diff 0) between ON and OFF.
+     Then hp=1 selected -> pixel at x0+0.9w within 12 levels of GREEN*255; hp=1 unselected -> ON image equals OFF image exactly.
+CHECK E: build both; ron_render_tests -> T12+20 pass.
+
+======================================================================
+GROUP F: ron_view integration, performance, VRAM  -> k=2, total T12+22
+======================================================================
+ ron_view additions (additive; with --lit 0 the Gate 12 look is untouched):
+   CLI: --lit 0|1 (default 1), --shadows 0|1 (default 1; both entity and terrain), --sun-elev DEG (default 42), --sun-az DEG (default 135), --no-marks.
+   With --lit 1: sun set via set_sun each frame from elev/az (sun_color unchanged); EntityRenderer::set_frustum_margin(ENTITY_FRUSTUM_MARGIN) when entity shadows are on.
+   Crowd (additive): hp = 1 for most; every 4th member (index%4==0) hp = 0.2 + 0.8*frac(i*0.6180339); every 64th member has FLAG_SELECTED.
+   Keys: F8 entity shadows on/off, F9 terrain shadows on/off, F10 marks on/off, [ and ] sun elevation -/+ 3 deg (clamped 5..85).
+   Frame order exactly as §1. --dump also writes scene.ppm (marks included).
+   At exit print: "lighting: shadows_entity=%d shadows_terrain=%d cascades=%d marks_icons=%u marks_bars=%u" plus the existing lines.
+ Tests (tests/render/test_light_perf.cpp):
+  21 Lit_FramePerf: own ledger; lit full frame at 20000 instances (crowd generator, dist 300, 640x360, sun elev 42, both shadows ON). Two GpuTimers: S = [render_shadows] only, M = [marks cull + icons + bars].
+     2 warm-up frames, 7 timed: median S < 4.0 ms and median M < 1.0 ms. glGetError()==0 after the frames. If it fails, report the 7 numbers for each; only SHADOW_RES and TERRAIN_SHADOW_STEPS may move. Do not change thresholds.
+  22 Vram_Gate13: a fresh ledger in the order ron_view uses (terrain, overlays, minimap, entity assets+renderer, then LightingSystem, UiAtlas, MarksRenderer): the ledger delta of the Gate 13 objects equals the sum of vram_bytes() EXACTLY;
+     ShadowMaps <= 80 MiB, UiAtlas <= 4 MiB, EntityBuffers delta <= 2 MiB; freeze succeeds; total <= 2304 MiB. Print the ledger dump lines for the new categories and the total.
+CHECK F: build both; ron_render_tests -> T12+22 pass. ./ron_view --hidden --frames 120 --crowd 20000 --dump exits 0 and prints the lighting line.
+
+======================================================================
+GROUP G: final verification
+======================================================================
+ G1. Debug AND Release: 0 errors, 0 warnings (project warning flags on, third-party excluded as before).
+ G2. ron_tests: count equals T_SIM from docs/gate13_baseline.txt, all pass.
+ G3. ron_render_tests: T12+22 pass in both builds. Gate 08 python selftest still ALL GROUPS PASS (35/35).
+ G4. ./ron_view --hidden --frames 120 --crowd 20000 --fog --dump -> exits 0; tools/check_scene_ppm.py scene.ppm and minimap.ppm both OK.
+     ./ron_view --hidden --frames 120 --crowd 20000 --dist 1200 --dump -> exits 0 (this scene.ppm shows the far-zoom icons). ./ron_view --hidden --frames 5 --lit 0 --crowd 3000 exits 0.
+     Report the fps line, the lighting line, the ledger total.
+ G5. Update docs/render_contracts.md: sections "Lighting" (L convention, cascade fit, shadow map state, receiver lookup, terrain march, PBR formulas), "Marks" (cull rule, icon/bar layouts, command buffer),
+     "Frame order (Gate 13)". Append the GEMINI.md paragraph from §1 and fix the adapter sentence as instructed.
+ G6. docs/spec_deviations.md updated if anything was logged (else leave it).
+
+======================================================================
+WHAT TO SEND BACK
+======================================================================
+ - "ron_render_tests: <N>/<N> in Debug and Release" plus the contents of docs/gate13_baseline.txt.
+ - docs/gate13_contract_notes.md Q1..Q5 answers (short) and anything marked DECISION; the icon table summary (models per icon).
+ - The Shadow_TerrainGpu percentage, the Lit_FramePerf 7 timings for S and M, the cascade categories printed by Shadow_CascadeDepth.
+ - The ron_view fps line, the lighting line, the new ledger total.
+ - Anything logged in docs/spec_deviations.md.
+ IF SOMETHING FAILS: send ONLY the group letter, the first failing test/assertion with file:line, and the last 30 lines of output.
+```
+
+When it's done, reply **"Gate 14"** (HDR VFX, bloom and ACES tonemap, which completes Phase III).
+
+To check by eye after Group F, run `ron_view --crowd 5000` unhidden:
+- **Shadows:** units and buildings should cast soft shadows on the ground that stay put as you pan. Press `F8` to toggle entity shadows. Press `F9` to toggle the mountain shadows, which are clearest when you lower the sun with `[`.
+- **Shadow swimming:** if the shadow edges crawl or shimmer while you rotate, the texel snapping in `cascade_fit` is wrong. Tell me which cascade it is.
+- **Icons:** zoom out (mouse wheel) and units become small coloured NATO frames: a rectangle for ground, a dome for air, a circle for naval, a square for buildings. The glyph inside should be upright. If it's flipped, that's the `v` direction in note Q4.
+- **Bars:** every 4th unit shows a health bar, and every 64th unit shows a full green bar because it is selected.
+
+**Risk points** (in case Gemini stalls):
+- **`Shadow_Terrain_Scene`:** it needs a spot on the real continent that is shadowed at a low sun elevation, and another that is fully lit nearby. If Gemini can't find one, it stops and reports, which is correct. Send me the log.
+- **`Shadow_Entity_Cascades`:** it is the most fragile test, because it relies on picking a triangle whose shadow lands on screen and isn't hidden by the unit itself. The prompt allows four camera yaws. A failure in only one cascade usually means a bug in that cascade's fit or early-out.
+- **`Marks_IconPixels`:** it depends on the exact quad size and pixel rounding. If the pixel checks are off by one, the fix is in the CPU layout code, not the threshold.
+- **Frame cost:** `Lit_FramePerf` is my guess at what the 3050 can do. The two allowed levers are `SHADOW_RES` and `TERRAIN_SHADOW_STEPS`.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-11-13T19:19:01+05:30.
+</ADDITIONAL_METADATA>

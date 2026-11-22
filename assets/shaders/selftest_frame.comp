@@ -1,0 +1,47 @@
+#version 460 core
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+#include "common/frame.glsl"
+
+layout(std430, binding = BIND_SSBO_TEST_OUT) writeonly buffer OutBuffer {
+    float out_f[];
+};
+
+void main() {
+    // 4 matrices: u_view, u_proj, u_view_proj, u_inv_view_proj
+    for (int c = 0; c < 4; ++c) {
+        for (int r = 0; r < 4; ++r) {
+            out_f[0 * 16 + c * 4 + r] = u_view[c][r];
+            out_f[1 * 16 + c * 4 + r] = u_proj[c][r];
+            out_f[2 * 16 + c * 4 + r] = u_view_proj[c][r];
+            out_f[3 * 16 + c * 4 + r] = u_inv_view_proj[c][r];
+        }
+    }
+
+    // 5 vectors: u_cam_pos, u_screen, u_time, u_sun_dir, u_sun_color at 64 + 4*k
+    out_f[64 + 0] = u_cam_pos.x;
+    out_f[64 + 1] = u_cam_pos.y;
+    out_f[64 + 2] = u_cam_pos.z;
+    out_f[64 + 3] = u_cam_pos.w;
+
+    out_f[68 + 0] = u_screen.x;
+    out_f[68 + 1] = u_screen.y;
+    out_f[68 + 2] = u_screen.z;
+    out_f[68 + 3] = u_screen.w;
+
+    out_f[72 + 0] = u_time.x;
+    out_f[72 + 1] = u_time.y;
+    out_f[72 + 2] = u_time.z;
+    out_f[72 + 3] = u_time.w;
+
+    out_f[76 + 0] = u_sun_dir.x;
+    out_f[76 + 1] = u_sun_dir.y;
+    out_f[76 + 2] = u_sun_dir.z;
+    out_f[76 + 3] = u_sun_dir.w;
+
+    out_f[80 + 0] = u_sun_color.x;
+    out_f[80 + 1] = u_sun_color.y;
+    out_f[80 + 2] = u_sun_color.z;
+    out_f[80 + 3] = u_sun_color.w;
+}

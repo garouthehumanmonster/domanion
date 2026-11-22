@@ -1,0 +1,47 @@
+#version 460 core
+
+#include "common/frame.glsl"
+#include "common/pbr_lite.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct PbrTestIn {
+    vec4 albedo_rough; // rgb = albedo, w = roughness
+    vec4 metal_ao_vis; // x = metal, y = ao, z = vis, w = sky_i
+    vec4 N;            // xyz = normal
+    vec4 V;            // xyz = view dir
+    vec4 L;            // xyz = light dir
+    vec4 sun_rgb;      // rgb = sun radiance
+    vec4 sky;          // rgb = ambient sky
+    vec4 ground;       // rgb = ambient ground
+};
+
+layout(std430, binding = BIND_SSBO_TEST_IN) readonly buffer TestInBlock {
+    PbrTestIn b_probes_in[];
+};
+
+layout(std430, binding = BIND_SSBO_TEST_OUT) writeonly buffer TestOutBlock {
+    vec4 b_results_out[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= 64u) return;
+
+    PbrTestIn pin = b_probes_in[idx];
+    vec3 col = pbr_shade(
+        pin.albedo_rough.rgb,
+        pin.albedo_rough.w,
+        pin.metal_ao_vis.x,
+        pin.metal_ao_vis.y,
+        pin.N.xyz,
+        pin.V.xyz,
+        pin.L.xyz,
+        pin.sun_rgb.rgb,
+        pin.metal_ao_vis.z,
+        pin.sky.rgb,
+        pin.ground.rgb,
+        pin.metal_ao_vis.w
+    );
+    b_results_out[idx] = vec4(col, 1.0);
+}

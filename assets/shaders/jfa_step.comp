@@ -1,0 +1,44 @@
+#version 460 core
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = IMG_JFA_IN, rg16f) readonly uniform image2D u_jfa_in;
+layout(binding = IMG_JFA_OUT, rg16f) writeonly uniform image2D u_jfa_out;
+
+uniform int u_k;
+uniform int u_g;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= u_g || p.y >= u_g) return;
+
+    vec2 c = vec2(2 * p + 1);
+    vec2 best_s = vec2(-1.0, -1.0);
+    float best_d = 1e30;
+    float best_key = 1e30;
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = p + ivec2(dx, dy) * u_k;
+            if (q.x < 0 || q.x >= u_g || q.y < 0 || q.y >= u_g) continue;
+
+            vec2 s = imageLoad(u_jfa_in, q).xy;
+            if (s.x < 0.0) continue;
+
+            vec2 e = s - c;
+            float d = dot(e, e);
+            float key = s.x + s.y * 4096.0;
+
+            if (d < best_d) {
+                best_d = d;
+                best_key = key;
+                best_s = s;
+            } else if (d == best_d && key < best_key) {
+                best_key = key;
+                best_s = s;
+            }
+        }
+    }
+
+    imageStore(u_jfa_out, p, vec4(best_s, 0.0, 0.0));
+}

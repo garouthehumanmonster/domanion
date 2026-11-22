@@ -1,0 +1,72 @@
+#version 460 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+struct SplatGpu {
+    vec2 pos;
+    float radius;
+    float depth;
+    float scorch;
+    float scorch_mul;
+    uint seed;
+    uint pad;
+};
+
+layout(std430, binding = BIND_SSBO_SPLATS) readonly buffer SplatBuffer {
+    SplatGpu u_splats[];
+};
+
+layout(binding = IMG_CRATER, rgba8) uniform image2D u_crater_img;
+
+uniform uint u_index;
+uniform ivec2 u_origin;
+uniform int u_n;
+uniform float u_extent;
+
+const float K_PI = 3.14159265358979323846;
+
+void main() {
+    ivec2 t = u_origin + ivec2(gl_GlobalInvocationID.xy);
+    if (t.x >= u_n || t.y >= u_n) return;
+
+    SplatGpu s = u_splats[u_index];
+
+    float texel = 4096.0 / float(u_n);
+    vec2 p = (vec2(t) + 0.5) * texel;
+    vec2 d = p - s.pos;
+    float r = length(d);
+    if (r > u_extent) return;
+
+    float ang = (r > 1e-4) ? atan(d.y, d.x) : 0.0;
+    float p1 = float(s.seed & 0xFFFFu) * (2.0 * K_PI / 65535.0);
+    float p2 = float(s.seed >> 16) * (2.0 * K_PI / 65535.0);
+    float nz = 0.5 + 0.25 * sin(3.0 * ang + p1) + 0.25 * sin(5.0 * ang + p2);
+
+    float rm = s.radius * (1.0 + 0.08 * (2.0 * nz - 1.0));
+    float tr = r / rm;
+    float a = 1.0 - tr * tr;
+    float bowl = (tr < 1.0) ? (-s.depth * a * a) : 0.0;
+    float q = (tr - 1.12) / 0.18;
+    float rim = 0.18 * s.depth * exp(-q * q);
+    float off = bowl + rim;
+
+    float sr = s.radius * s.scorch_mul;
+    float edge0 = 0.6 * sr;
+    float edge1 = sr;
+    float x_ss = clamp((r - edge0) / (edge1 - edge0), 0.0, 1.0);
+    float ss = x_ss * x_ss * (3.0 - 2.0 * x_ss);
+    float sc = s.scorch * mix(0.85, 1.0, nz) * (1.0 - ss);
+
+    vec4 old_rgba = imageLoad(u_crater_img, t);
+    float old_code = floor(old_rgba.r * 255.0 + 0.5);
+    float old_off = (old_code - 128.0) * 0.0625;
+    float new_off = clamp(old_off + off, -8.0, 7.9375);
+    float new_code = clamp(floor(new_off / 0.0625 + 0.5) + 128.0, 0.0, 255.0);
+
+    float old_g = floor(old_rgba.g * 255.0 + 0.5);
+    float sc_code = floor(clamp(sc, 0.0, 1.0) * 255.0 + 0.5);
+    float new_g = max(old_g, sc_code);
+
+    vec4 new_rgba = vec4(new_code / 255.0, new_g / 255.0, old_rgba.b, old_rgba.a);
+    imageStore(u_crater_img, t, new_rgba);
+}

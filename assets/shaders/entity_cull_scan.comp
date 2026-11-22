@@ -1,0 +1,78 @@
+#version 460 core
+
+#include "entity_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = BIND_SSBO_MODELS) readonly buffer ModelsBlock {
+    ModelGpu b_models[];
+};
+
+layout(std430, binding = BIND_SSBO_COUNTERS) readonly buffer CountersBlock {
+    uint b_counters[];
+};
+
+layout(std430, binding = BIND_SSBO_INDIRECT) buffer IndirectBlock {
+    DrawCmd b_commands[];
+};
+
+shared uint s[256];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    uint bucket_count = u_counts.z;
+
+    uint b0 = 2u * t;
+    uint b1 = 2u * t + 1u;
+
+    uint c0 = (b0 < bucket_count) ? b_counters[16u + b0] : 0u;
+    uint c1 = (b1 < bucket_count) ? b_counters[16u + b1] : 0u;
+
+    s[t] = c0 + c1;
+    barrier();
+
+    // Hillis-Steele inclusive scan
+    for (uint stride = 1u; stride < 256u; stride <<= 1) {
+        uint val = 0u;
+        if (t >= stride) {
+            val = s[t - stride];
+        }
+        barrier();
+        s[t] += val;
+        barrier();
+    }
+
+    uint excl = s[t] - (c0 + c1);
+
+    if (b0 < bucket_count) {
+        uint m0 = b0 / 3u;
+        uint l0 = b0 % 3u;
+        b_commands[b0].count = b_models[m0].lod[l0].index_count;
+        b_commands[b0].instanceCount = c0;
+        b_commands[b0].firstIndex = b_models[m0].lod[l0].first_index;
+        b_commands[b0].baseVertex = b_models[m0].lod[l0].base_vertex;
+        b_commands[b0].baseInstance = excl;
+    } else if (b0 < 384u) {
+        b_commands[b0].count = 0u;
+        b_commands[b0].instanceCount = 0u;
+        b_commands[b0].firstIndex = 0u;
+        b_commands[b0].baseVertex = 0;
+        b_commands[b0].baseInstance = 0u;
+    }
+
+    if (b1 < bucket_count) {
+        uint m1 = b1 / 3u;
+        uint l1 = b1 % 3u;
+        b_commands[b1].count = b_models[m1].lod[l1].index_count;
+        b_commands[b1].instanceCount = c1;
+        b_commands[b1].firstIndex = b_models[m1].lod[l1].first_index;
+        b_commands[b1].baseVertex = b_models[m1].lod[l1].base_vertex;
+        b_commands[b1].baseInstance = excl + c0;
+    } else if (b1 < 384u) {
+        b_commands[b1].count = 0u;
+        b_commands[b1].instanceCount = 0u;
+        b_commands[b1].firstIndex = 0u;
+        b_commands[b1].baseVertex = 0;
+        b_commands[b1].baseInstance = 0u;
+    }
+}

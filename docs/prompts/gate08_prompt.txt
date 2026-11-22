@@ -1,0 +1,291 @@
+<USER_REQUEST>
+# Gate 08: Texture Baker (trim sheets, terrain tiles, VFX flipbooks, MSDF atlas, BC compression) + C++ TextureData loader
+
+**Dependency:** this gate needs Gate 07 Group A (`tools/asset_common/` and `assets/source/trims.json`). It does not need the Gate 07 model bake itself. If those files are missing, the prompt tells Flash to stop and report.
+
+I can't run any of this code, so the tests are built to fail loudly and early rather than pass vacuously:
+- **Exact hand-computed BC1, BC4 and BC5 decode vectors.** Both the Python and C++ decoders must hit them.
+- **Probe texels.** Python records decoded probe texels in the file and C++ must reproduce them. This cross-checks the two decoders against each other.
+- **MSDF fallback.** One boolean switches the MSDF corner trick off if it misbehaves, so a hard-to-debug corner case can't block the gate.
+- **Test counts.** Python totals 35 tests across six groups, and C++ adds 6. If Gates 06 and 07 were fully green, the C++ total should be 51.
+
+Open a **new Antigravity task** and paste everything inside the block.
+
+````
+# GATE 08: TEXTURE BAKER (tools/texture_baker) + BC COMPRESSION + C++ TextureData LOADER
+
+## 0. RULES FOR THIS TASK (read first, obey literally)
+- GEMINI.md rules apply. Do not modify Gate 01-07 source files. Only exceptions: CMake source lists/targets (add the new .cpp and the test file to ron_assets and the test executable) and docs/.
+- PRECONDITION: tools/asset_common/{rng.py,hashing.py,pngio.py} and assets/source/trims.json exist (Gate 07 Group A). If any is missing, STOP and tell me. Do not recreate them. (If only trims.json is missing, run `python tools/model_baker/trims.py --write`.)
+- Do not import from tools/model_baker or tools/theatre_baker. New shared helpers go into tools/asset_common/ (this gate adds noise.py, bc.py, texformat.py, mips.py).
+- Work in 7 GROUPS (A to G). After each group run its check command. Do NOT start the next group until it prints PASS.
+- Never weaken a test to get green. If a number in this spec is provably impossible, STOP, quote the spec line, fix code and test, and append an entry to docs/spec_deviations.md. Values you may change WITHOUT an entry: only the TUNABLES in section 1.4 within the stated ranges.
+- Python 3.13 only, numpy only (tools/texture_baker/requirements.txt contains exactly: numpy>=2.1,<3). No scipy/PIL/matplotlib/numba. If `python --version` is not 3.13.x, use `py -3.13`.
+- DETERMINISM: no time seeds, no Python hash(), no np.random, no set-order dependence. Randomness only via asset_common.rng.Rng or integer-hash noise. Seed for anything named N = fnv1a64(N) & 0xFFFFFFFF. float32 for image math unless stated.
+- Each Python file <= 400 lines, with a short docstring at the top. All numeric constants live in tools/texture_baker/params.py.
+- Entry scripts begin with sys.path.insert(0, <tools dir>) and sys.path.insert(0, <own dir>).
+- Outputs (git-ignored): assets/compiled/textures/textures_2026.tex26, textures_2026.manifest.json, textures_2026.preview.png.
+- Also create docs/asset_contracts.md (Group F) summarising the contracts of sections 1 and 2 in under 120 lines.
+
+## 1. LOCKED DECISIONS
+### 1.1 Texture set (9 textures, in this order and with these names)
+| id | name | format | size | layers | mips | flags |
+|0|trim_albedo|BC1|2048x2048|1|12|bit0 srgb|
+|1|trim_normal|BC5|2048x2048|1|12|0|
+|2|trim_orm|BC1|2048x2048|1|12|0 (R=AO, G=roughness, B=metallic)|
+|3|trim_emissive|BC4|2048x2048|1|12|0|
+|4|terrain_albedo|BC1|512x512|8|10|bit0 srgb|
+|5|terrain_normal|BC5|512x512|8|10|0|
+|6|terrain_rh|BC1|512x512|8|10|0 (R=height 0..1, G=roughness, B=0)|
+|7|vfx_atlas|BC3|2048x2048|1|4|bit1 premultiplied alpha|
+|8|msdf_atlas|RGBA8|1024x512|1|1|0|
+Format codes: BC1=0, BC3=1, BC4=2, BC5=3, RGBA8=4. Mip level m has size max(1, w>>m) x max(1, h>>m). Compressed levels use blocks_x=max(1,(w+3)//4), blocks_y likewise; block bytes BC1=8, BC3=16, BC4=8, BC5=16, RGBA8 texel=4 bytes.
+Trim textures: the renderer must clamp the sampled LOD to <= 5 (tiles bleed at deeper mips). Record this in docs/asset_contracts.md.
+
+### 1.2 Exact BC formats (little-endian). Python AND C++ must implement exactly these.
+BC1 block (8 B): u16 c0, u16 c1, u32 idx (pixel k = row*4+col, row 0 = top; 2 bits at bit 2k). Expand 565 -> 8 bit: r=(v<<3)|(v>>2), g=(v<<2)|(v>>4), b=(v<<3)|(v>>2). If c0>c1 (4-colour): p0,p1; p2=(2*p0+p1+1)//3; p3=(p0+2*p1+1)//3 (per channel, integer). Else (3-colour): p2=(p0+p1)//2, p3=(0,0,0) with alpha 0. Alpha=255 for every other entry.
+BC4 block (8 B): u8 r0, u8 r1, then 48-bit LE integer holding 16 3-bit indices (pixel k at bit 3k). If r0>r1: p0=r0, p1=r1, p[1+i]=((7-i)*r0+i*r1+3)//7 for i=1..6 (-> indices 2..7). Else: p0=r0, p1=r1, p[1+i]=((5-i)*r0+i*r1+2)//5 for i=1..4 (-> indices 2..5), p6=0, p7=255.
+BC5 block (16 B) = BC4 block for R, then BC4 block for G. Decoded as (R, G, 0, 255).
+BC3 block (16 B) = BC4 block for alpha, then a BC1 colour block that is ALWAYS decoded in 4-colour mode (ignore the c0>c1 test). Decoded as (r,g,b,a).
+RGBA8: raw bytes.
+Hand-computed decode vectors (must decode EXACTLY; used in Python Group A and C++ Group G):
+ V1 BC1: bytes 00 F8 1F 00 E4 E4 E4 E4 -> every row = (255,0,0,255),(0,0,255,255),(170,0,85,255),(85,0,170,255).
+ V2 BC4 8-value: bytes FF 00 88 C6 FA 88 C6 FA -> pixels k=0..15 = [255,0,219,182,146,109,73,36] repeated twice.
+ V3 BC4 6-value: bytes 00 FF 88 C6 FA 88 C6 FA -> [0,255,51,102,153,204,0,255] repeated twice.
+ V4 BC5: V2 bytes then V3 bytes -> pixel k = (V2[k%8], V3[k%8], 0, 255).
+
+### 1.3 Container ".tex26" (little-endian, offsets multiples of 64)
+Header 64 B: u32 magic=0x36325854 (bytes 'T','X','2','6'); u32 version=1; u32 total_bytes; u32 texture_count (=9); u64 content_xxh64 (XXH64 seed 0 over bytes [64,total_bytes)); u32 glyph_offset; u32 glyph_count (=95); bytes 32..63 zero.
+Texture table at offset 64: texture_count x 64 B records (max 16): 
+ 0 u64 name_hash (FNV-1a-64 of name) | 8 u32 format | 12 u16 width | 14 u16 height | 16 u16 layers | 18 u16 mips | 20 u32 data_offset | 24 u32 data_bytes | 28 u32 flags | 32 u8 probe_a[4] | 36 u8 probe_b[4] | 40..63 zero.
+ probe_a = decoded RGBA of texel (x=37,y=91) of mip 0, layer 0. probe_b = decoded RGBA of texel (0,0) of the LAST mip, layer 0. Both are computed by the writer by DECODING the encoded bytes.
+Data: first texture data at round_up(64+texture_count*64, 64); each next at previous end rounded up to 64. Within a texture: level-major, then layer: for level in 0..mips-1: for layer in 0..layers-1: image bytes. Padding is zero. Then the glyph table at the next 64-aligned offset: 95 records of 16 B: {u16 cell_x, u16 cell_y, u16 cell_w, u16 cell_h, i16 offset_x_q, i16 offset_y_q, u16 advance_q, u16 reserved=0}; record i is for ASCII code 32+i; the *_q values are pixels*64 at 48-px em. total_bytes = glyph table end rounded up to 64.
+
+### 1.4 TUNABLES (the only adjustable values)
+ NORMAL_SCALE=24.0 (range 8..48): gradient scale for height->normal.
+ MSDF_USE_PSEUDO=True (bool): set False only if test E4 fill-agreement fails with True (then record in docs/spec_deviations.md and skip only the corner-sharpness assertion).
+Everything else is fixed.
+
+### 1.5 Trim sheet contract (from Gate 07)
+Sheet 2048x2048, 8x8 grid of 256 px tiles; trim id t -> col=t%8,row=t//8, tile origin (col*256,row*256) in pixels, row 0 = TOP of the image. Ids 0..31 painted from the table in 3.2. Ids 32..63: albedo (128,128,128), normal xy encoded (128,128), ORM (255,128,0), emissive 0. Trim names must equal the names in assets/source/trims.json (checked).
+Normal map convention (tangent space): u increases to the right, v increases DOWN the image. Encoded n.xy = (-dh/du, -dh/dv) direction, i.e. a surface whose height increases to the right has negative x; one whose height increases downward has negative y. z = sqrt(1-x^2-y^2) (never stored). Byte = rint((n*0.5+0.5)*255).
+
+## 2. GROUP A: noise, BC codecs, mips, container
+Files: tools/asset_common/{noise.py, bc.py, mips.py, texformat.py}; tools/texture_baker/{requirements.txt, params.py, selftest.py}. selftest.py supports `--group A..G` and `--group ALL`, prints each test name with PASS/FAIL, and "GROUP X PASS (n/n)".
+### 2.1 noise.py
+ hash2(ix,iy,seed): same integer hash as Gate 06: uint32 numpy wraparound under np.errstate(over='ignore'): h=(ix*0x27D4EB2D)^(iy*0x165667B1)^(seed*0x9E3779B1); h^=h>>15; h*=0x85EBCA6B; h^=h>>13; h*=0xC2B2AE35; h^=h>>16 (ix,iy int64 masked to 32 bits, seed masked to 32 bits).
+ pnoise(x,y,px,py,seed): value noise on a PERIODIC lattice: x,y float32 arrays in lattice units; corner coordinates are taken modulo (px,py) (ints >= 1) before hashing; corner value = hash/4294967296 as float32; fade t^3(t(6t-15)+10); bilinear; result in [0,1). pnoise(x+px,y,...) == pnoise(x,y,...) exactly.
+ pfbm(x,y,px,py,seed,octaves,gain=0.5): octave o uses coordinates x*2^o,y*2^o, periods px*2^o,py*2^o, seed+o*101; amplitudes gain^o; normalised by the amplitude sum; result in [0,1].
+ grid(n, fx, fy): returns (x,y) float32 [n,n] arrays with x=(i+0.5)/n*fx (column index i), y=(j+0.5)/n*fy (row j), so that pfbm(x,y,fx,fy,...) tiles seamlessly over the n x n image.
+ smoothstep(e0,e1,x). Also afbm(x,y,seed,octaves) = the same as pfbm without periodicity (huge periods 1<<20) for non-tiling effects.
+### 2.2 bc.py (vectorised numpy; images are uint8 [H,W,C]; pad to multiples of 4 by edge replication; decoders crop back)
+ encode_bc1(rgb) -> bytes: per block: mn,mx per channel over the 16 pixels; d=(mx-mn)>>4; hi=mx-d, lo=mn+d; quantise each to 565 with q5=(v*31+127)//255, q6=(v*63+127)//255; c0=packed(hi), c1=packed(lo) (so c0>=c1 always). If c0==c1: all indices 0. Otherwise build the 4-colour palette with the EXACT decode formula and choose the nearest entry per pixel by squared RGB error (ties: lowest index). 
+ encode_bc4(v) -> bytes for a uint8 [H,W] array: r0=max, r1=min (if equal: indices 0), palette exactly as in 1.2 (8-value mode), nearest by absolute error (ties: lowest index), pack 48 bits LE. encode_bc5(rg [H,W,2]); encode_bc3(rgba): alpha via the BC4 path and colour via the BC1 path (colour RGB taken as is, premultiplied). 
+ decode_bc1/bc3/bc4/bc5(data, w, h) -> uint8 [h,w,4] (RGBA per 1.2; BC4 -> (v,0,0,255)). decode_rgba8. decode_texel(fmt,data,w,h,x,y) -> 4 ints. block_bytes(fmt), level_size(fmt,w,h).
+ psnr(a,b) = 10*log10(255^2/mse) over all channels (inf -> 99.0).
+ If a quality assertion in tests 3/4 misses, you may add ONE least-squares endpoint-refinement pass to encode_bc1 (iterating indices -> optimal endpoints -> requantise -> re-pick), not weaken the test.
+### 2.3 mips.py
+ mip_chain(img uint8 [H,W,C], mode) -> list of uint8 arrays down to 1x1: mode 'srgb' (RGB channels converted by a 256-entry sRGB->linear LUT, 2x2 box averaged in linear float32, converted back with the standard sRGB OETF and rint; alpha channel if present averaged linearly), 'linear' (plain average, rint), 'normal2' (2-channel uint8 xy: decode to [-1,1], z=sqrt(max(0,1-x^2-y^2)), average the 3-vectors, renormalise, re-encode xy with rint((v*0.5+0.5)*255)), 'premul' (RGBA all channels linear average). If a dimension is already 1, only the other halves.
+### 2.4 texformat.py
+ TexSpec(name, fmt, width, height, layers, mips, flags, data: list indexed [level][layer] of bytes). level_layer_offset(fmt,w,h,layers,mips,level,layer) -> int (relative to the texture's data start). write_tex26(path, specs, glyph_bytes) builds the exact layout of 1.3 (computes probes by decoding, hash over [64,total), atomic write via .tmp + os.replace). read_tex26(path) -> dict {header fields, textures: [dict with all record fields + data memoryview], glyphs: np structured array}; verifies magic, version, total size, table, hash; raises ValueError with a clear message.
+### 2.5 Group A tests (6)
+ 1 noise: pnoise/pfbm periodic wrap exact (x vs x+px, y vs y+py, array_equal); outputs in [0,1), float32; deterministic; different seeds differ (mean abs diff > 0.05); grid(64,4,4) pfbm image: |column 63 vs column 0 difference| mean <= 2 x mean |difference of adjacent columns| (seamless).
+ 2 decode vectors: V1..V4 of section 1.2 decode EXACTLY with decode_bc1/bc4/bc5; plus a BC3 block made of V2 bytes + V1 bytes decodes to colours of V1 with alpha from V2; plus a BC3 colour block with c0<c1 (swap the first 4 bytes of V1) still decodes in 4-colour mode (assert that pixel index 3 is NOT alpha-0 transparent-black).
+ 3 BC1 codec: 256x256 smooth test image (three pfbm channels, period 4, 4 octaves, scaled to 0..255): PSNR >= 28 dB; solid-colour image (200,100,50) decodes within 4 per channel; all-zero image decodes to zeros; encoded length == (256/4)^2*8; a 6x5 image (non-multiple of 4) round-trips shape (5,6,4).
+ 4 BC4/BC5/BC3 codec: smooth single channel image: BC4 PSNR >= 38 dB, solid value exact, two-valued {0,255} blocks exact; BC5 (two channels) PSNR >= 38; BC3 alpha PSNR >= 38 and premultiplied colour PSNR >= 26; lengths 8/16/16 per block.
+ 5 mips: 2048 chain has 12 levels with correct sizes down to 1x1; 1024x512 chain has 11 levels; constant image stays constant at every level; sRGB checker (alternating 0 and 255 pixels in both axes) level 1 value within 1 of 188 per channel; 'normal2' chain keeps decoded vector length within 0.02 of 1 on a random (Rng) normal field at level 1..3; 'premul' keeps rgb <= alpha+1 on a random premultiplied image.
+ 6 tex26 container: write 3 synthetic textures (BC1 64x64 mips 3; BC5 32x32 layers 2 mips 6; RGBA8 16x8 mips 1) plus 95 dummy glyph records; read back: arrays equal byte for byte per [level][layer], all offsets %64==0, hash verified, probes equal decode_texel of the stored data, glyph_count 95; flipping one payload byte -> ValueError; level_layer_offset matches the actual read position for every (level,layer).
+CHECK A: `python tools/texture_baker/selftest.py --group A` prints "GROUP A PASS (6/6)".
+
+## 3. GROUP B: trim sheet painter
+Files: tools/texture_baker/{trim_table.py, patterns.py, trim_paint.py}; extend selftest (--group B).
+### 3.1 trim_paint.py API
+ height_to_normal(h float32 [n,n], strength) -> float32 [n,n,3]: gx=NORMAL_SCALE*strength*(roll(h,-1,axis=1)-roll(h,+1,axis=1))/2; gy likewise along axis 0 (rows = v, downwards); g=(gx,gy); scale each pixel's g so |g| <= 1.3333 (g *= min(1, 1.3333/|g|)); n = normalize(-gx,-gy,1). (np.roll wraps; tiles are painted to be near-periodic.)
+ paint_trim(spec) -> TileMaps(albedo f32 [256,256,3] sRGB-coded 0..1, height, rough, metal, ao, emis: f32 [256,256] 0..1, normal f32 [256,256,3]). Uses periodic noise with seed=fnv1a64(name)&0xFFFFFFFF.
+ Base recipe (all patterns start here): n1=pfbm(grid(256,8,8),4 octaves,s), n2=pfbm(grid(256,32,32),3 octaves,s+1); albedo=lerp(c1,c2,n1)*(1+0.12*(n2-0.5)); height=0.5*n2 (patterns override/modify); rough=clip(rough_base+0.15*(n2-0.5),0,1); metal=metal_base (patterns may lower it locally by up to 30%); ao=1-0.35*cavity where cavity = clip((0.5-height)*2,0,1) unless the pattern sets it; emis=0 unless stated.
+### 3.2 Table (trim_table.py): id | name | pattern | c1 sRGB | c2 sRGB | rough | metal | normal strength | emis
+ 0 steel_plain | plain | (150,155,160) (120,125,130) | 0.45 | 1.0 | 0.30 | 0
+ 1 steel_worn | worn | (140,140,140) (100,90,80) | 0.65 | 0.85 | 0.60 | 0
+ 2 armor_olive | paint | (78,86,52) (62,70,42) | 0.55 | 0.0 | 0.35 | 0
+ 3 armor_desert | paint | (176,152,108) (150,128,90) | 0.55 | 0.0 | 0.35 | 0
+ 4 armor_grey | paint | (110,116,120) (90,96,100) | 0.55 | 0.0 | 0.35 | 0
+ 5 camo_woodland | camo | palette (60,72,40) (34,45,28) (88,70,44) (24,30,22) | 0.80 | 0.0 | 0.30 | 0
+ 6 camo_desert | camo | palette (190,165,120) (160,130,90) (120,100,70) (210,190,150) | 0.80 | 0.0 | 0.30 | 0
+ 7 camo_urban | camo | palette (120,122,125) (80,82,86) (50,52,56) (150,152,155) | 0.80 | 0.0 | 0.30 | 0
+ 8 cloth_tunic | cloth | (190,170,130) (165,145,105) | 0.90 | 0.0 | 0.50 | 0
+ 9 cloth_dark | cloth | (60,55,52) (40,36,34) | 0.90 | 0.0 | 0.50 | 0
+ 10 leather | leather | (110,70,40) (80,48,26) | 0.65 | 0.0 | 0.50 | 0
+ 11 skin | plain | (205,160,130) (180,135,105) | 0.60 | 0.0 | 0.15 | 0
+ 12 wood_planks | planks | (150,105,60) (110,72,40) | 0.80 | 0.0 | 0.60 | 0
+ 13 wood_log | logs | (95,65,38) (60,40,24) | 0.85 | 0.0 | 0.70 | 0
+ 14 stone_block | blocks | (150,148,140) (115,112,105) | 0.90 | 0.0 | 0.80 | 0
+ 15 stone_smooth | plain | (170,168,160) (140,138,130) | 0.75 | 0.0 | 0.25 | 0
+ 16 brick | brick | (150,70,50) (120,52,38) mortar (170,165,155) | 0.90 | 0.0 | 0.80 | 0
+ 17 concrete | plain | (150,150,148) (125,125,122) | 0.92 | 0.0 | 0.30 | 0
+ 18 concrete_panel | panels | (160,160,158) (135,135,133) | 0.90 | 0.0 | 0.50 | 0
+ 19 glass_window | window | (40,70,100) (20,40,60) | 0.05 | 0.0 | 0.10 | 0
+ 20 roof_tile | scales | (160,70,45) (125,50,32) | 0.85 | 0.0 | 0.70 | 0
+ 21 roof_metal | seams | (110,120,128) (85,95,102) | 0.40 | 0.90 | 0.50 | 0
+ 22 rubber_tread | tread | (35,35,36) (22,22,23) | 0.90 | 0.0 | 0.80 | 0
+ 23 hazard_stripe | hazard | (240,200,20) (25,25,25) | 0.60 | 0.0 | 0.30 | 0
+ 24 glow_emissive | glow | (140,230,255) (255,255,255) | 0.30 | 0.0 | 0.10 | emis constant 1.0
+ 25 solar_panel | solar | (24,40,90) (15,25,60) | 0.20 | 0.10 | 0.30 | 0
+ 26 foliage_leaf | leaves | (62,110,40) (38,80,28) | 0.80 | 0.0 | 0.50 | 0
+ 27 bark | bark | (82,62,46) (52,38,28) | 0.90 | 0.0 | 0.90 | 0
+ 28 grass_tuft | streaks | (110,150,60) (70,110,40) | 0.85 | 0.0 | 0.40 | 0
+ 29 gold | plain | (235,190,70) (200,150,40) | 0.30 | 1.0 | 0.10 | 0
+ 30 oil_dark | plain | (20,20,24) (10,10,12) | 0.20 | 0.0 | 0.10 | 0
+ 31 ice_crystal | crystal | (190,225,245) (150,195,230) | 0.15 | 0.0 | 0.50 | sparkle: emis in 0..0.25, mean <= 0.15
+### 3.3 Pattern vocabulary (patterns.py: one function per pattern, each returning a dict of overrides for albedo/height/rough/metal/ao/emis; keep each under ~25 lines)
+ plain: nothing extra. worn: horizontal scratches from pfbm(grid(256,2,96)) thresholded with smoothstep(0.62,0.70) -> albedo +0.25, rough -0.1; rust blotches (pfbm freq 6, threshold 0.6) blend albedo to c2 and metal x0.7. paint: like plain plus chipped edges (pfbm freq 24 thresholded) revealing steel colour (150,150,150) with height -0.15. camo: pick one of the 4 palette colours by pfbm(freq 4, 3 octaves) quantised into 4 bands (use quantile-free fixed thresholds 0.35/0.5/0.65), small lighten by n2. cloth: weave = 0.5+0.25*sin(2pi x/4)*sin(2pi y/4) for height; albedo *(0.9+0.2*weave). leather: height from ridged cracks (1-|2n-1|) of pfbm freq 10; albedo darkened in cracks. planks: horizontal planks 32 px high (8 per tile), per-plank tint offset +-0.1 from hash2(row), grain = stretched pfbm(grid(256,3,48)); 2 px dark gap at plank joints with height 0. logs: vertical bark ridges: pfbm(grid(256,48,3)) ridged for height; darker in grooves. blocks: staggered stone blocks 64 px high, 96 px wide (odd rows offset 48 px; widths wrap), 3 px mortar grooves (height 0, albedo darkened 40%), per-block tint +-0.08. brick: rows 16 px, bricks 32 px wide, odd rows offset 16 px, mortar 2 px (colour = the spec's mortar colour, height 0.1 vs bricks 0.6). panels: 128 px panels with 2 px seams and 4 corner rivets (small discs r=3 raised). window: vertical gradient albedo (c1 top -> c2 bottom), diagonal bright streak(s) (rough 0.02 inside), muntin frame: 4 px bars every 64 px (height 0.8, rough 0.5, albedo (30,30,32)). scales: roof tiles in rows 16 px high, 24 px wide staggered, rounded lower edge (height from a vertical ramp per tile), per-tile tint +-0.1. seams: vertical standing seams every 32 px (6 px wide raised, 2 px bright edge). tread: horizontal cleats 12 px pitch (6 px raised, 6 px gap darker); the pattern must be vertically periodic with period 12 px rounded so 256 px is covered (pitch 16 px -> 16 cleats; use 16). hazard: diagonal stripes ((x+y)//32)%2 selecting c1/c2, edges hard, height flat 0.5 with 1 px dark outline at transitions. glow: albedo = lerp(c1,c2, radial 0..1 from tile centre), emis=1.0 everywhere, rough 0.3, height flat. solar: 8x8 cells of 32 px, each cell darker blue with a 2 px silver gap grid (albedo (170,175,180), metal 0.5 in gaps only); thin horizontal busbars. leaves: blotchy pfbm freq 12 with darker veins from ridged pfbm(freq 20); alpha not needed. bark: vertical ridged fbm freq (4,40) high contrast, deep grooves (height 0). streaks: vertical grass blades: pfbm(grid(256,64,4)) stretched; brighter tips toward top (v small). crystal: faceted look: floor(pfbm(freq 5)*6)/6 quantised bands give height facets; sparkle emis = smoothstep(0.85,0.95,pfbm freq 40)*0.25.
+ (Exact formulas inside these patterns are your choice; the TESTS below decide acceptance.)
+### 3.4 Sheet assembly (trim_paint.py)
+ assemble_sheet() -> dict of uint8 arrays {albedo [2048,2048,3], normal_xy [2048,2048,2], orm [2048,2048,3], emissive [2048,2048]}; tile placement per 1.5; albedo = rint(clip(a,0,1)*255); normal xy bytes per 1.5; orm = (ao, rough, metal) bytes; emissive byte.
+### 3.5 Group B tests (6)
+ 1 table: 32 entries, ids 0..31, names equal the names in assets/source/trims.json in id order; every pattern name used has a function in patterns.py; every colour component 0..255.
+ 2 painting: paint_trim for all 32 trims returns arrays of the right shapes, finite, albedo/height/rough/metal/ao/emis in [0,1], deterministic (two calls identical), and no two trims have identical albedo (mean abs difference between any two tile albedos > 0.01).
+ 3 normals: height_to_normal on a synthetic ramp h=x/255 gives n.x < -0.05 and |n.y| < 1e-6 everywhere (interior columns); ramp downward h=y/255 gives n.y < -0.05; flat gives (0,0,1) exactly; all 32 painted normals have z >= 0.6-1e-6 and unit length within 1e-5.
+ 4 materials: mean metal > 0.7 for {steel_plain, steel_worn, roof_metal, gold} and < 0.15 for every other trim; mean rough of glass_window < 0.2; emissive: glow_emissive has emis == 1.0 everywhere; every other trim except ice_crystal has emis == 0 everywhere; ice_crystal mean emis <= 0.15 and max <= 0.25; albedo mean of gold: R > B+0.25; skin R > B; glass_window B > R.
+ 5 structure: hazard_stripe tile: pixel (10,10) and (50,10) have clearly different luminance (diff > 0.3) and ((x+y)//32)%2 parity decides which; brick tile: mortar pixel rows (a row index with row%16 in {0,1}) have mean height < 0.3 and brick body rows > 0.4; stone_block grooves: mean height at rows (y%64 in 0..2) < mean height elsewhere - 0.2.
+ 6 sheet: assemble_sheet shapes/dtypes correct; the byte at the centre of every tile equals the byte computed from that trim's TileMaps centre pixel; tiles 32..63 hold the neutral values of 1.5; trims.json px rect of every trim lies inside its tile.
+CHECK B: "GROUP B PASS (6/6)".
+
+## 4. GROUP C: terrain tile set
+Files: tools/texture_baker/terrain_tiles.py; extend selftest (--group C).
+ TERRAIN_LAYERS (id: name | c1 | c2 | rough | feature): 0 seabed (120,110,90) (95,88,72) 0.90 ripples; 1 beach (222,206,160) (196,180,135) 0.90 fine grain; 2 grass (88,138,52) (62,106,38) 0.85 blades/clumps; 3 forest_floor (58,72,38) (40,50,28) 0.88 leaf litter blotches (90,66,40); 4 arid (196,164,104) (170,138,84) 0.92 cracked-earth polygons (ridged low-frequency); 5 tundra (176,182,170) (140,146,138) 0.80 snow patches (235,240,245) where pfbm > 0.6; 6 rock (122,116,108) (88,84,78) 0.85 strata + cracks; 7 cliff (92,84,76) (62,56,50) 0.85 strong horizontal strata.
+ paint_terrain_layer(i) -> albedo uint8 [512,512,3], normal_xy uint8 [512,512,2], rh uint8 [512,512,3] (R=height byte, G=rough*255, B=0). EVERYTHING is generated with pfbm on grid(512,fx,fy) with integer frequencies, so every layer tiles seamlessly. Base recipe: albedo=lerp(c1,c2,pfbm freq 4, 5 octaves) with detail multiplier from pfbm freq 32; height from the feature (normalised so that its 1st-99th percentile spans >= 0.5 of [0,1], computed with np.quantile float64); normal via height_to_normal-style gradient (the same function imported from trim_paint.height_to_normal, strength 0.8; cliff 1.2, rock 1.0, seabed 0.5) and the same encoding as 1.5.
+ build_terrain() -> (albedo [8,512,512,3], normal_xy [8,512,512,2], rh [8,512,512,3]).
+ Group C tests (5):
+ 1 layers: 8 names exactly as listed, shapes/dtypes right, deterministic.
+ 2 tileable: for every layer and for albedo, height(R of rh) and normal x: mean|col511-col0| <= 2.0 x mean|col255-col256| and the same for rows (rows 511 vs 0 vs 255/256).
+ 3 colours (sRGB-coded means in 0..1): grass G > R and G > B; arid R > G > B; tundra luminance (0.299R+0.587G+0.114B) > 0.55; rock |R-B| < 0.10; cliff luminance < rock luminance; beach luminance > 0.6; seabed luminance < 0.55.
+ 4 height/normal: every layer's height 1st-99th percentile span >= 0.5; normals z >= 0.6-1e-6, unit length; rough bytes within 0.02 of the table roughness on average.
+ 5 build_terrain output shapes; layer order; two calls identical.
+CHECK C: "GROUP C PASS (5/5)".
+
+## 5. GROUP D: VFX flipbooks
+Files: tools/texture_baker/{vfx_effects.py, vfx.py}; extend selftest (--group D).
+ Layout: 2048x2048 RGBA8 PREMULTIPLIED atlas. 12 effects, each 16 frames in a 4x4 grid of 128-px frames inside a 512x512 cell; effect e at cell (e%4, e//4) -> pixel origin (e%4*512, e//4*512); frame f at (f%4*128, f//4*128) inside the cell. Effects 12..15 are empty (all zero). Frame pixel (i,j) has local coords X=((i+0.5)/128)*2-1, Y=((j+0.5)/128)*2-1 (Y down).
+ Time: loop effects t=f/16 (f=0..15), one-shot effects t=f/15.
+ EFFECTS (id name kind): 0 fire_explosion once | 1 smoke_puff once | 2 muzzle_flash once | 3 dust_cloud once | 4 spark_burst once | 5 shockwave_ring once | 6 fire_loop loop | 7 smoke_loop loop | 8 laser_impact once | 9 emp_pulse once | 10 debris_chunks once | 11 nuke_mushroom once.
+ render_frame(effect_id, t) -> float32 [128,128,4] premultiplied RGBA in [0,1]. Rules for ALL effects:
+  - rgb = colour*alpha with colour in [0,1] so rgb <= alpha (+1e-6).
+  - Final alpha is multiplied by edge = 1 - smoothstep(0.80, 0.96, max(|X|,|Y|)); and the outermost 2 px on every side are forced to exactly 0 (rgb and alpha).
+  - One-shot effects carry a global fade factor that is EXACTLY 0 at t=1 (e.g. (1-t)^p or 1-smoothstep(a,1,t)).
+  - Loop effects use the crossfade trick: frame(t) = (1-t)*P(t) + t*P(t-1) where P(s) is the pattern with noise scrolled by s*K, so frame(1.0) == frame(0.0) exactly.
+  - Noise comes from afbm (aperiodic) with seed fnv1a64(effect_name)&0xFFFFFFFF; sparks/debris positions come from Rng(fnv1a64(name)).
+  Design guide (your choice of exact formulas): fire_explosion = noise-warped expanding disc, radius 0.12+0.62*sqrt(t), colour ramp white-yellow core -> orange -> dark red; smoke_puff = grey soft disc growing 0.12->0.40; muzzle_flash = 6-spike star decaying fast (visible mostly in the first third); dust_cloud = wide flat tan ellipse; spark_burst = 24 radial streaks flying out and fading; shockwave_ring = ring of radius 0.45*t, width growing 0.03->0.07; fire_loop = flame column rising (noise scrolled upward); smoke_loop = dark rising column; laser_impact = bright core + glow + small ring; emp_pulse = blue-white noisy ring + crackle; debris_chunks = 12 dark chunks (small squares) flying out under gravity; nuke_mushroom = stem + cap growing, orange/white, fading late.
+ vfx.py: assemble_vfx_atlas() -> uint8 [2048,2048,4] with rint(x*255); frame_origin(effect, frame) -> (x,y); also `VFX_INFO` list (name, loop flag, frame_count 16).
+ Group D tests (6):
+ 1 registry: 12 effects with the exact names/loop flags; render_frame returns float32 [128,128,4]; two calls identical.
+ 2 ranges: all 12x16 frames finite, in [0,1], rgb <= alpha+1e-4, outermost 2 px rows/cols exactly zero.
+ 3 visibility: for each effect the max alpha over frames >= 0.6, the peak-frame alpha sum >= 400, and in no frame is more than 90% of the pixels with alpha > 0.05.
+ 4 one-shot timing: for the 10 one-shot effects the alpha sum of the t=1 frame <= 2% of the peak frame's sum; consecutive frames (f,f+1) differ (mean abs RGBA difference > 0.001) whenever at least one of the two has alpha sum > 1% of peak.
+ 5 loops: for fire_loop and smoke_loop: max abs difference between render_frame(id,1.0) and render_frame(id,0.0) <= 1e-5; frame 0 and frame 8 differ (mean abs diff > 0.005); min alpha sum over the 16 frames >= 50% of the max.
+ 6 atlas: shape/dtype; frame (e,f) region equals rint(render_frame*255) for 6 sampled (e,f) pairs; cells 12..15 all zero; deterministic.
+CHECK D: "GROUP D PASS (6/6)".
+
+## 6. GROUP E: MSDF font and icon atlas
+Files: tools/texture_baker/{font_data.py, msdf.py, shapes.py, msdf_atlas.py}; extend selftest (--group E).
+### 6.1 Layout (atlas 1024x512 RGBA8; R,G,B = MSDF channels, A = true signed distance)
+ Value encoding for every channel: v = clip(0.5 + sd_px/(2*RANGE_PX), 0, 1), byte=rint(v*255), RANGE_PX=4, sd_px positive INSIDE. Background (never drawn) bytes are 0.
+ Glyph cells: 48x48 px, ASCII 32..126 (95 glyphs), 12 columns, row-major from (0,0): cell of code c at ((c-32)%12*48, (c-32)//12*48) -> uses x 0..575, y 0..383.
+ Icon cells: 64x64 px, 32 icons, 16 columns from (0,384): icon i at (i%16*64, 384+i//16*64) -> y 384..511.
+### 6.2 Font (font_data.py): stroke font on a 4 x 6 grid (x 0..4 right, y 0..6 up, descenders to -1, y up). STROKES dict char -> string, strokes separated by " / ", points "x,y" separated by spaces. Lowercase a..z reuse the uppercase strokes with x*0.9, y*0.72 ("small caps"). Include EXACTLY these:
+ A "0,0 2,6 4,0 / 0.8,2 3.2,2" | B "0,0 0,6 2.6,6 3.6,5.2 3.6,3.8 2.6,3 0,3 / 2.6,3 3.8,2.2 3.8,0.8 2.8,0 0,0" | C "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1" | D "0,0 0,6 2.5,6 4,4.5 4,1.5 2.5,0 0,0" | E "4,6 0,6 0,0 4,0 / 0,3 3,3" | F "4,6 0,6 0,0 / 0,3 3,3" | G "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1 4,3 2.2,3" | H "0,0 0,6 / 4,0 4,6 / 0,3 4,3" | I "1,6 3,6 / 2,6 2,0 / 1,0 3,0" | J "4,6 4,1 3,0 1,0 0,1" | K "0,0 0,6 / 4,6 0,2.5 / 1.3,3.7 4,0" | L "0,6 0,0 4,0" | M "0,0 0,6 2,3 4,6 4,0" | N "0,0 0,6 4,0 4,6" | O "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0" | P "0,0 0,6 3,6 4,5 4,4 3,3 0,3" | Q "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0 / 2.5,2 4,0" | R "0,0 0,6 3,6 4,5 4,4 3,3 0,3 / 2,3 4,0" | S "4,5 3,6 1,6 0,5 0,4 1,3 3,3 4,2 4,1 3,0 1,0 0,1" | T "0,6 4,6 / 2,6 2,0" | U "0,6 0,1 1,0 3,0 4,1 4,6" | V "0,6 2,0 4,6" | W "0,6 1,0 2,3 3,0 4,6" | X "0,6 4,0 / 4,6 0,0" | Y "0,6 2,3 4,6 / 2,3 2,0" | Z "0,6 4,6 0,0 4,0"
+ 0 "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0 / 1,1.2 3,4.8" | 1 "0.8,5 2,6 2,0 / 0.8,0 3.2,0" | 2 "0,5 1,6 3,6 4,5 4,4 0,0 4,0" | 3 "0,5 1,6 3,6 4,5 4,4 3,3 1.5,3 / 3,3 4,2 4,1 3,0 1,0 0,1" | 4 "3,0 3,6 0,2 4,2" | 5 "4,6 0.4,6 0,3.4 2.6,3.8 4,2.8 4,1 3,0 1,0 0,1" | 6 "3.6,6 1,5 0,3.5 0,1 1,0 3,0 4,1 4,2.6 3,3.6 1,3.6 0,2.6" | 7 "0,6 4,6 1.6,0" | 8 "1,3 0,4 0,5 1,6 3,6 4,5 4,4 3,3 1,3 0,2 0,1 1,0 3,0 4,1 4,2 3,3" | 9 "0.4,0 3,1 4,2.5 4,5 3,6 1,6 0,5 0,4.2 1,3.2 3,3.2 4,4.2"
+ Punctuation: '.' "1.8,0 2.2,0" | ',' "2,0 1.4,-1" | ':' "2,1 2,1.4 / 2,4 2,4.4" | ';' "2,1 1.5,-0.5 / 2,4 2,4.4" | '!' "2,6 2,2 / 2,0 2,0.4" | '?' "0,5 1,6 3,6 4,5 4,4 2,3 2,2 / 2,0 2,0.4" | '-' "0.5,3 3.5,3" | '+' "0.5,3 3.5,3 / 2,1.5 2,4.5" | '/' "0,0 4,6" | '\\' "4,6 0,0" | '%' "0.2,6 0.2,4.8 1.2,4.8 1.2,6 0.2,6 / 2.8,0 2.8,1.2 3.8,1.2 3.8,0 2.8,0 / 0,0 4,6" | '(' "3,6.5 1.5,5 1.5,1 3,-0.5" | ')' "1,6.5 2.5,5 2.5,1 1,-0.5" | '[' "3,6 1,6 1,0 3,0" | ']' "1,6 3,6 3,0 1,0" | '{' "3,6.5 2.2,6 2.2,3.8 1.2,3 2.2,2.2 2.2,0 3,-0.5" | '}' "1,6.5 1.8,6 1.8,3.8 2.8,3 1.8,2.2 1.8,0 1,-0.5" | '=' "0.5,2 3.5,2 / 0.5,4 3.5,4" | '*' "2,1.5 2,4.5 / 0.7,2.2 3.3,3.8 / 0.7,3.8 3.3,2.2" | '#' "1,0 1.6,6 / 2.4,0 3,6 / 0,2 4,2 / 0,4 4,4" | '"' "1.2,6 1.2,4.5 / 2.8,6 2.8,4.5" | "'" "2,6 2,4.5" | '<' "3.5,5 0.5,3 3.5,1" | '>' "0.5,5 3.5,3 0.5,1" | '_' "0,-1 4,-1" | '|' "2,6.5 2,-0.5" | '^' "0.5,3.5 2,6 3.5,3.5" | '`' "1.2,6 2.2,4.8" | '~' "0,2.8 1,3.8 2,3 3,2.2 4,3.2" | '$' "4,5 3,6 1,6 0,5 0,4 1,3 3,3 4,2 4,1 3,0 1,0 0,1 / 2,6.8 2,-0.8" | '&' "4,0 0.5,4 0.5,5 1.5,6 2.5,5 2.5,4 0,1 1,0 2.5,0 4,2.5" | '@' "3.2,2 3.2,4 1.5,4 1.5,2 3.2,2 / 3.2,2 4,2 4,5 3,6 1,6 0,5 0,1 1,0 3,0" | ' ' (space) no strokes, advance 3.0 units.
+ Glyph render (after the lowercase transform): S=26/6 px per unit; stroke half-width 0.42 units; xmin,xmax = extremes of all stroke points; cell pixel mapping: px_x = 8 + (gx-xmin)*S, px_y(from top) = 36 - gy*S. Signed distance (px, positive inside) = 0.42*S - min over all segments of the point-to-segment distance (a single-point or zero-length stroke is a disc); evaluated at pixel centres (col+0.5,row+0.5); R=G=B=A channel value by 6.1 encoding.
+ Metrics record for code c: cell (x,y,48,48); offset_x_q = round((xmin*S - 8)*64); offset_y_q = 36*64 (=2304); advance_q = round(((xmax-xmin)+1.6)*S*64) (space: round(3.0*S*64)).
+### 6.3 MSDF core (msdf.py), geometry is y-UP (math coordinates); convert to image rows at render time (row r centre -> y = H-(r+0.5)).
+ Contours: list of (points [k,2], hole: bool); make_contours normalises orientation: outer = CCW, hole = CW, interior is always on the LEFT of each edge direction. Edges: a->b for consecutive points (closed).
+ color_edges(points) -> int array of channel masks per edge. A corner between consecutive edges is SHARP if cos(turn angle) < cos(35 deg) = 0.8192 (i.e. dot of unit directions < 0.8192). Colour indices: 0=(R,G) mask 0b011, 1=(G,B) mask 0b110, 2=(B,R) mask 0b101, WHITE mask 0b111. Rules: k = number of sharp corners. k==0 -> every edge WHITE. k==1 and the contour has >= 3 edges -> split the edges into three consecutive near-equal groups with colours 0,1,2 (if < 3 edges, WHITE). k>=2 -> the k runs between sharp corners (cyclic, starting at the first edge after the first sharp corner) get colour index j%3 for run j, except when k%3==1 and k>=4: the LAST run gets colour 1. Adjacent runs never share a colour; every channel is covered by at least one edge.
+ msdf_eval(points [N,2], contours, use_pseudo=MSDF_USE_PSEUDO) -> float64 [N,4] (R,G,B, true_sd) in distance units, positive inside. For each channel c: among edges whose mask has bit c, pick the edge with the smallest true point-to-segment distance (ties: first); signed value = cross(b-a, p-a)/|b-a| (the perpendicular signed distance, positive when p is left of the edge) — this equals the pseudo-distance, and when use_pseudo is False and the projection parameter t is outside [0,1] use instead sign*true_distance where sign = +1 if cross >= 0 else -1; when t is inside [0,1] the perpendicular value is used in both modes. true_sd = (smallest true distance over ALL edges) with sign + if the point is inside (even-odd rule over all contours), else -. Vectorise over points (chunks of 2048) x edges.
+ Render: render_icon(contours) -> uint8 [64,64,4]; icons are defined in centred coordinates (origin at the icon centre, units = pixels) and translated by (32,32) before rendering.
+### 6.4 Icons (shapes.py). Helpers: rect(cx,cy,w,h), poly(points), regular_polygon(cx,cy,r,n,rot_deg), ellipse(cx,cy,rx,ry,n=48), circle(cx,cy,r,n=48), star(cx,cy,R,r,n), plus_shape(arm,thick) (12 vertices: h=thick/2, L=arm: (h,h),(h,L),(-h,L),(-h,h),(-L,h),(-L,-h),(-h,-h),(-h,-L),(h,-L),(h,-h),(L,-h),(L,h)), rotate(points,deg), ring(outer_pts, inner_pts). Index, name, geometry (centred px units):
+ 0 frame_friendly rect 44x30 | 1 frame_hostile diamond (regular_polygon n=4, r=24, rot 0) | 2 frame_neutral rect 36x36 | 3 frame_unknown regular octagon r=24 rot 22.5
+ 4 sym_infantry plus_shape(arm 16, thick 5) rotated 45 | 5 sym_armor ring(ellipse 17x11, ellipse 11x5) | 6 sym_artillery circle r7 | 7 sym_air polygon [(-20,-4),(0,12),(20,-4),(20,-12),(0,4),(-20,-12)] | 8 sym_naval two contours: trapezoid [(-18,-4),(18,-4),(12,-12),(-12,-12)] and triangle [(-2,0),(-2,16),(10,0)] | 9 sym_recon polygon [(-14,-12),(-8,-12),(14,12),(8,12)] | 10 sym_missile polygon [(0,16),(8,4),(3,4),(3,-14),(-3,-14),(-3,4),(-8,4)] | 11 sym_engineer H polygon [(-12,-12),(-6,-12),(-6,-3),(6,-3),(6,-12),(12,-12),(12,12),(6,12),(6,3),(-6,3),(-6,12),(-12,12)] | 12 sym_logistics triangle regular_polygon n=3 r=14 rot 90 | 13 sym_drone four circles r4 at (+-10,+-10) plus rect 8x8 at the centre
+ 14 res_food circle r14 at (0,-2) plus leaf triangle [(0,13),(10,22),(2,22)] | 15 res_timber three rects 36x8 at y=-12,0,12 | 16 res_metal ring(regular_polygon r16 n=6, circle r6) | 17 res_wealth star R=18 r=8 n=5 (tip up) | 18 res_knowledge ring(diamond r18, diamond r8) | 19 res_oil teardrop: tip (0,20), then circle r12 centred (0,-6) from angle 20 deg around to 160 deg going the long way (12 points) | 20 res_silicon ring(rect 32x32, rect 14x14) plus 4 pin rects 6x4 centred at (0,+-19) and (+-19,0) rotated suitably (gaps >= 2 px from the ring)
+ 21 ui_arrow_up triangle [(0,16),(14,-8),(-14,-8)] | 22 ui_arrow_down mirrored | 23 ui_check polygon [(-18,0),(-12,-6),(-5,-1),(12,16),(18,10),(-5,-13)] ... any simple check polygon is fine if its centre pixel region is inside; keep it inside +-20 px | 24 ui_cross plus_shape(arm 16, thick 6) rotated 45 | 25 ui_plus plus_shape(arm 16, thick 6) | 26 ui_minus rect 32x6 | 27 ui_play triangle [(-10,-14),(-10,14),(16,0)] | 28 ui_ring ring(circle r18, circle r12) | 29 ui_square_ring ring(rect 36x36, rect 24x24) | 30 ui_gear ring(star R=18 r=14 n=8 with 16 points, circle r6) | 31 ui_dot circle r10
+ Keep every shape inside +-24 px of its centre (the 4 px range plus 4 px margin fits the 64-px cell).
+### 6.5 msdf_atlas.py: build_msdf_atlas() -> (atlas uint8 [512,1024,4], glyph_bytes: 95 records of 16 B per 1.3). GLYPH_CODES = 32..126.
+### 6.6 Group E tests (6)
+ 1 font table: all codes 32..126 present (lowercase mapped); every char in A-Z0-9 has >= 1 stroke; all points within x in [0,4], y in [-1,6.8]; xmin/xmax defined; space has no strokes.
+ 2 glyph render: 95 cells rendered shape (48,48,4); space has no pixel with R>127; every other glyph has >= 20 pixels with R>127; the 36 glyphs A-Z and 0-9 are pairwise distinct (XOR of the (R>127) masks has >= 10 pixels for every pair); metrics: advance_q of 'I' < advance_q of 'W'; offset_y_q == 2304 for all; 'M' and 'W' ink fits in the cell (no value>0 within 1 px of the cell border for any glyph, i.e. rows/cols 0 and 47 are all 0).
+ 3 glyph sanity: for every non-space glyph the pixel nearest the first stroke point has R >= 0.6*255; the corner pixel (0,0) of the cell has value 0.
+ 4 msdf core: (a) rect(20x20 at (32,32)) in y-up coords: at the centre median(R,G,B) = +10 within 0.01 and true_sd = +10; at (52,32) median = -10 within 0.01; at (40,32)... median +2 within 0.01 (distance to the right edge at x=42). (b) if MSDF_USE_PSEUDO: at the point 1.5 px diagonally outside the bottom-left corner (corner (22,22), point (20.5,20.5)) the median is -1.5 within 0.35 while true_sd is about -2.12 within 0.05. (c) FILL AGREEMENT: for each of the 32 icons rendered at 64x64: among pixels whose |true_sd| (from the alpha channel) > 1.5 px, >= 99.0% have (median(R,G,B) > 127) equal to (alpha > 127). If this fails with MSDF_USE_PSEUDO=True, set it False (allowed), record a deviation, and re-run; the assertion itself stays.
+ 5 edge colouring: regular hexagon -> 6 sharp corners, adjacent edge masks never equal, every channel covered; square -> runs coloured 0,1,2,1 (k=4 rule); triangle -> 0,1,2; circle(48) -> all WHITE; a lens polygon with 2 sharp corners -> 2 runs, different masks; ring icons: the hole contour is oriented CW (signed area < 0) and the outer CCW (> 0).
+ 6 atlas: shape (512,1024,4), uint8; icon i centre texel of ids {0,1,2,3,4,6,25,31} has median > 127 and of ids {5,16,18,20,28,29,30} has median < 128 (holes); glyph/icon cells do not overlap and are inside the atlas; 95 glyph records; two builds byte-identical.
+CHECK E: "GROUP E PASS (6/6)".
+
+## 7. GROUP F: pipeline, writer integration, preview, docs
+Files: tools/texture_baker/{bake_textures.py, preview.py}; docs/asset_contracts.md; extend selftest (--group F and --group ALL).
+ bake_textures.py CLI: `python tools/texture_baker/bake_textures.py [--out assets/compiled/textures] [--no-preview]`. Exit codes 0 ok, 3 any build error. Function bake_all(out_dir, preview=True, keep_sources=False) -> dict (sources when keep_sources). Stages (print "[stage] name seconds"): 1 trims (assemble_sheet) -> 2 terrain -> 3 vfx -> 4 msdf -> 5 encode+mips (trim_albedo 'srgb' mips + BC1; trim_normal 'normal2' + BC5; trim_orm 'linear' + BC1; trim_emissive 'linear' + BC4; terrain_albedo 'srgb' per layer + BC1; terrain_normal 'normal2' + BC5; terrain_rh 'linear' + BC1; vfx_atlas 'premul' 4 mips + BC3; msdf_atlas RGBA8, 1 mip) -> 6 write_tex26 -> 7 manifest json (sort_keys, indent 2: per texture name, hash hex, format, size, layers, mips, flags, data bytes, probe_a, probe_b; plus 'trim_names', 'terrain_layers', 'vfx_effects' (name, loop, cell origin), 'icon_names', 'glyph_count', terrain_roughness list, 'trim_max_lod': 5) -> 8 preview.
+ preview.py: write_preview(path, sources) -> 2048x1024 RGB PNG via asset_common.pngio: left 1024x1024 = trim albedo downsampled 2x (box); top-right area x 1024..1535,y 0..255 = 8 terrain albedo tiles downsampled to 64x64 (8 across, 64 px each) y 0..63 then terrain normals (xyz visualised, z from the formula) y 64..127, then at y 128..255 the MSDF atlas median channel downsampled 2x (512x256) at x 1024..1535; x 1536..2047,y 0..255 = trim_orm downsampled 4x (512x... use the first 1024 rows? use full 2048 -> 4x box -> 512x512 cropped to the top 256 rows); bottom half: x 1024..1535,y 512..1023 = VFX atlas downsampled 4x composited over (30,30,36) with premultiplied over; x 1536..2047,y 512..1023 = trim normal visualised (xyz) downsampled 4x. Unused areas (28,30,36).
+ docs/asset_contracts.md: trim sheet contract, normal convention, container layout, texture table, atlas layouts (glyph + icon cells), VFX layout, BC formulas, LOD clamp.
+ Group F tests (6) (the group's first test runs bake_all(tmp, preview=True, keep_sources=True) in-process and stores the result for the other tests; the determinism test runs the CLI with --no-preview in a second temp dir):
+ 1 bake: finished OK; read_tex26 works; 9 textures in table order with the exact names/formats/sizes/layers/mips/flags of section 1.1; glyph_count 95.
+ 2 determinism: second bake (CLI, --no-preview) file sha256 equals the first.
+ 3 sizes: file size between 15 MiB and 40 MiB; for every texture data_bytes == sum over levels/layers of level_size; offsets 64-aligned and non-overlapping; total_bytes % 64 == 0.
+ 4 fidelity: decode level 0 of trim_albedo and compare with the source albedo: PSNR >= 26 dB; trim_normal decoded xy vs source: PSNR >= 34 dB; trim_emissive PSNR >= 38; terrain_albedo layer 2 (grass) PSNR >= 26; vfx_atlas colour PSNR >= 26 and alpha PSNR >= 36; msdf_atlas bytes identical to the source.
+ 5 probes: for every texture, probe_a and probe_b recomputed with bc.decode_texel from the stored bytes equal the stored probes; probe_a of trim_emissive is within the BC4 range and probe_b of msdf_atlas equals source texel (0,0) of its only level.
+ 6 preview + manifest: PNG signature valid, IHDR 2048x1024; at least 90% of the left 1024x1024 trim preview pixels differ from the background (28,30,36); manifest has 9 textures, 32 trim names, 8 terrain layers, 12 effects, 32 icon names, trim_max_lod == 5.
+CHECK F: "GROUP F PASS (6/6)". Then run the REAL bake: `python tools/texture_baker/bake_textures.py`. Expected: exit 0, about 25-35 MB, a few minutes at most. Tell me the path of textures_2026.preview.png.
+Final python count: `python tools/texture_baker/selftest.py --group ALL` -> "ALL GROUPS PASS (35/35)" (A 6 + B 6 + C 5 + D 6 + E 6 + F 6).
+
+## 8. GROUP G: C++ TextureData loader + 6 tests (total tests previous + 6; 51 if Gates 06 and 07 were fully green)
+Add src/assets/texture_data.hpp/.cpp to the EXISTING static library ron_assets (created in Gate 07; if it does not exist, STOP). Add tests/test_textures.cpp to the existing test executable. Same pattern as ModelData for file lookup, arena loading (no heap allocation) and corrupt-copy handling. -fno-exceptions -fno-rtti; float allowed in ron_assets.
+### 8.1 API (namespace ron::assets; reuse core types and the Gate 01 xxh64)
+ enum class TexError : u8 {Ok, TooSmall, BadMagic, BadVersion, BadSize, BadHeader, BadTable, BadSectionSize, BadHash, BadRecord};
+ enum class TexFormat : u32 {BC1=0, BC3=1, BC4=2, BC5=3, RGBA8=4};
+ struct TexRec (64 B) and GlyphRec (16 B) with the exact byte layouts of 1.3; static_assert sizeof and offsetof(name_hash, format, width, layers, data_offset, flags, probe_a, probe_b).
+ class TextureData:
+  TexError init_from_blob(const u8*, usize): chain in order: size>=64 (TooSmall) -> magic -> version==1 -> total_bytes==size (BadSize) -> texture_count in 1..16 and glyph_count==95 (BadHeader) -> table+glyph offsets within total, %64==0 (BadTable) -> every record: format<=4, width/height power of two in 1..4096, layers 1..16, mips>=1 and <= floor(log2(max(w,h)))+1, data_offset%64==0, data_offset+data_bytes<=total, data_bytes == computed total (BadSectionSize / BadRecord for the others) -> xxh64(data+64,size-64,0)==content_xxh64 (BadHash).
+  TexError load_file(const char*, MemoryArena&); u32 texture_count() const; const TexRec& texture(u32) const; i32 find(u64 name_hash) const; static u64 fnv1a64(const char*); static u32 level_bytes(TexFormat,u16 w,u16 h,u32 level); u32 level_offset(const TexRec&, u32 level, u32 layer) const (absolute offset in blob); const u8* level_ptr(u32 tex, u32 level, u32 layer) const; const GlyphRec& glyph(u32 code) const (code 32..126).
+  static decode_bc1_block(const u8* in, u8 out[16][4]); decode_bc4_block(const u8* in, u8 out[16]); decode_bc3_block, decode_bc5_block; bool decode_texel(u32 tex, u32 level, u32 layer, u32 x, u32 y, u8 rgba[4]) const (exactly the formulas of 1.2).
+### 8.2 The 6 tests (tests/test_textures.cpp, names exactly; missing file -> FAIL with "run: python tools/texture_baker/bake_textures.py")
+ 1 Tex_LoadHeader: loads assets/compiled/textures/textures_2026.tex26; texture_count 9, glyph_count 95; copy with flipped payload byte -> BadHash; first byte changed -> BadMagic; truncated by 64 B -> BadSize; 10-byte buffer -> TooSmall (arena/scratch, no heap).
+ 2 Tex_TableIntegrity: find() of the 9 names (via fnv1a64) >= 0 in table order; each record has the exact format/width/height/layers/mips/flags of section 1.1; data_bytes equals the recomputed sum; offsets 64-aligned, ascending, non-overlapping, below glyph_offset.
+ 3 Tex_BCDecodeVectors: V1..V4 of section 1.2 decode EXACTLY, plus the BC3 4-colour-mode rule (a BC3 block whose colour part has c0<c1 still produces opaque non-black for index 3 of V1 with swapped endpoints).
+ 4 Tex_DecodeProbes: for all 9 textures decode_texel at (mip 0, layer 0, 37,91) equals probe_a and at (last mip, layer 0, 0,0) equals probe_b, exactly.
+ 5 Tex_NormalsAndTrims: decode 2000 pseudo-random texels (Gate 01 Xoshiro, fixed seed) of trim_normal level 0: with x=r/255*2-1, y=g/255*2-1 assert x*x+y*y <= 0.71; trim_emissive at tile 24 centre (128,896) >= 200 and at tile 0 centre (128,128) <= 20; trim_albedo at tile 29 centre (x=1408,y=896): R >= B+40.
+ 6 Tex_FontIcons: for ASCII 33..126 count texels with R>127 in the glyph's 48x48 cell of msdf_atlas (RGBA8 raw) >= 20; code 32 count == 0; offset_y_q == 2304 for all 95 glyphs; advance_q('I') < advance_q('W'); for icons 0..31 (cell origin (i%16*64, 384+i/16*64)) count of R>127 texels >= 40; centre texel (32,32) of icons 5,16,18,20,28,29,30 has median(R,G,B)<128 and of icons 0,1,2,3,4,6,25,31 median>127 (median of three bytes).
+ Expected total: previous + 6.
+
+## 9. FINAL VERIFICATION (run all, show output tail of each)
+ 1. python tools/texture_baker/selftest.py --group ALL     -> "ALL GROUPS PASS (35/35)"
+ 2. python tools/texture_baker/bake_textures.py            -> exit 0 (re-run only if the file is missing)
+ 3. node tools/schema_compiler/compile_db.mjs --check      -> still passes
+ 4. Release build + test runner                            -> all pass (51/51 if Gates 06 and 07 were fully green)
+ 5. Debug build + test runner                              -> same count, 0 warnings in both builds
+ 6. docs/spec_deviations.md updated (write "none" if nothing deviated) and docs/asset_contracts.md present.
+ Report: test counts (Release/Debug), selftest count, final values of NORMAL_SCALE and MSDF_USE_PSEUDO, per-texture data bytes, file size in MB, bake seconds per stage, PSNR values of test F4, and the path of the preview PNG.
+````
+
+---
+
+**Add this line to GEMINI.md** at the start of the task:
+
+`Texture bakes: tools/texture_baker writes assets/compiled/textures/textures_2026.tex26 (BC1/BC3/BC4/BC5/RGBA8, level-major then layer). Contracts are in docs/asset_contracts.md. Never change a BC format formula in only one language; Python and C++ must stay bit-identical.`
+
+**What to send back:** reply **"Gate 09"** once the selftest says `ALL GROUPS PASS (35/35)` and the C++ tests are green in both builds. Open `textures_2026.preview.png`. You should see:
+- the trim sheet (32 material swatches) on the left;
+- a strip of terrain tiles on the top right;
+- fuzzy explosion and smoke flipbooks on the bottom right;
+- the font and icon atlas as grey stroke shapes.
+
+Gate 09 is where Python stops and the real engine starts: SDL3, the OpenGL 4.6 context, the VRAM ledger and the shader pipeline.
+
+**If something fails**, paste only:
+1. The group letter.
+2. The first failing test name and assertion, with file:line.
+3. The last 30 lines of output.
+
+The riskiest parts of this gate:
+- **Group A test 3, BC1 quality.** The encoder is a simple range-fit, so the 28 dB bar may need the optional refinement pass.
+- **Group E test 4c, MSDF fill agreement.** This is what the `MSDF_USE_PSEUDO` fallback is for.
+- **Group C, tileability.** If a layer fails, tell me the layer name.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-11-13T12:25:08+05:30.
+</ADDITIONAL_METADATA>

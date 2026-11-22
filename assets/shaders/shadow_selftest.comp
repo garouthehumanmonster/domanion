@@ -1,0 +1,33 @@
+#version 460 core
+
+#include "common/frame.glsl"
+#include "common/shadow_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct ShadowProbeIn {
+    vec4 pos; // xyz = world_pos, w = unused
+    vec4 dir; // xyz = L (direction to sun), w = unused
+};
+
+layout(std430, binding = BIND_SSBO_TEST_IN) readonly buffer TestInBlock {
+    ShadowProbeIn b_probes_in[];
+};
+
+layout(std430, binding = BIND_SSBO_TEST_OUT) writeonly buffer TestOutBlock {
+    float b_results_out[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= 64u) return;
+
+    vec3 pos = b_probes_in[idx].pos.xyz;
+    vec3 L   = b_probes_in[idx].dir.xyz;
+    if (length(L) < 1e-4) {
+        L = u_sun_dir.xyz;
+    }
+
+    float vis = sample_terrain_shadow(pos, vec3(0.0, 1.0, 0.0), L);
+    b_results_out[idx] = vis;
+}

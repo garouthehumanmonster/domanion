@@ -1,0 +1,93 @@
+{
+  "DamageArchetype": [
+    "Melee_Slash",
+    "Kinetic_Pierce",
+    "Explosive_Frag",
+    "Chemical_AntiArmor",
+    "Siege_Structural",
+    "EMP_Electronic"
+  ],
+  "GuidanceType": [
+    "Unguided",
+    "Ballistic_Indirect",
+    "IR",
+    "Laser",
+    "ActiveRadar",
+    "GPS_INS",
+    "FPV_CommandLink",
+    "Hitscan_Beam"
+  ],
+  "SensorBand": [
+    "Optical",
+    "Radar",
+    "Sonar",
+    "CounterBattery",
+    "EW_Jamming"
+  ],
+  "UnitClass": [
+    "Citizen",
+    "Infantry",
+    "Ranged",
+    "Cavalry",
+    "Armor",
+    "Siege",
+    "AirDefense",
+    "ElectronicWarfare",
+    "Logistics",
+    "Naval",
+    "Aircraft",
+    "Drone",
+    "Strategic"
+  ],
+  "TechPillar": [
+    "Military",
+    "Civic",
+    "Commerce",
+    "Science"
+  ],
+  "TechEffectOp": [
+    "DamageMult",
+    "BorderRadiusAdd",
+    "CommerceCapAdd",
+    "ResearchSpeedMult"
+  ],
+  "MovementDomain": [
+    "Land_Infantry",
+    "Land_Heavy",
+    "Amphibious",
+    "Naval_Coastal",
+    "Naval_Deep",
+    "Air_Low_Rotary_Swarm",
+    "Air_High_Sortie",
+    "Ballistic_Exo",
+    "Static_Building"
+  ],
+  "UnitFlag": [
+    "Builder",
+    "Stealth",
+    "RadarEmitter",
+    "EwEmitter",
+    "ShootAndScoot",
+    "Interceptable",
+    "Naval",
+    "Air"
+  ],
+  "WeaponFlag": [
+    "TopAttack",
+    "Melee",
+    "AntiAir",
+    "AntiGround",
+    "Hitscan"
+  ],
+  "BuildingFlag": [
+    "CityCenter",
+    "Gather",
+    "Production",
+    "Library",
+    "Port",
+    "Airbase",
+    "Defensive",
+    "Strategic",
+    "Market"
+  ]
+}

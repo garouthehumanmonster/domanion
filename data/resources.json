@@ -1,0 +1,72 @@
+[
+  {
+    "id": "food",
+    "name": "Food",
+    "index": 0,
+    "unlock_age": 0,
+    "start_amount": 500,
+    "base_income_cap_per_min": 600,
+    "cap_growth_per_tier": 0.25,
+    "gather_rate_per_citizen_per_sec": 0.9
+  },
+  {
+    "id": "timber",
+    "name": "Timber",
+    "index": 1,
+    "unlock_age": 0,
+    "start_amount": 500,
+    "base_income_cap_per_min": 600,
+    "cap_growth_per_tier": 0.25,
+    "gather_rate_per_citizen_per_sec": 0.8
+  },
+  {
+    "id": "metal",
+    "name": "Metal",
+    "index": 2,
+    "unlock_age": 0,
+    "start_amount": 300,
+    "base_income_cap_per_min": 600,
+    "cap_growth_per_tier": 0.25,
+    "gather_rate_per_citizen_per_sec": 0.7
+  },
+  {
+    "id": "wealth",
+    "name": "Wealth",
+    "index": 3,
+    "unlock_age": 0,
+    "start_amount": 200,
+    "base_income_cap_per_min": 400,
+    "cap_growth_per_tier": 0.25,
+    "gather_rate_per_citizen_per_sec": 0.5
+  },
+  {
+    "id": "knowledge",
+    "name": "Knowledge",
+    "index": 4,
+    "unlock_age": 1,
+    "start_amount": 0,
+    "base_income_cap_per_min": 200,
+    "cap_growth_per_tier": 0.25,
+    "gather_rate_per_citizen_per_sec": 0.6
+  },
+  {
+    "id": "oil",
+    "name": "Oil",
+    "index": 5,
+    "unlock_age": 5,
+    "start_amount": 0,
+    "base_income_cap_per_min": 300,
+    "cap_growth_per_tier": 0.25,
+    "gather_rate_per_citizen_per_sec": 1.0
+  },
+  {
+    "id": "silicon",
+    "name": "Silicon",
+    "index": 6,
+    "unlock_age": 7,
+    "start_amount": 0,
+    "base_income_cap_per_min": 150,
+    "cap_growth_per_tier": 0.25,
+    "gather_rate_per_citizen_per_sec": 0.5
+  }
+]

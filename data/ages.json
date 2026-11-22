@@ -1,0 +1,134 @@
+[
+  {
+    "id": "ancient",
+    "name": "Ancient",
+    "index": 0,
+    "year_start": -4000,
+    "year_end": -800,
+    "advance_cost": {},
+    "min_techs": 0
+  },
+  {
+    "id": "classical",
+    "name": "Classical",
+    "index": 1,
+    "year_start": -800,
+    "year_end": 500,
+    "advance_cost": {
+      "food": 300,
+      "timber": 200,
+      "metal": 200,
+      "wealth": 250
+    },
+    "min_techs": 3
+  },
+  {
+    "id": "medieval",
+    "name": "Medieval",
+    "index": 2,
+    "year_start": 500,
+    "year_end": 1450,
+    "advance_cost": {
+      "food": 600,
+      "timber": 400,
+      "metal": 400,
+      "wealth": 500,
+      "knowledge": 150
+    },
+    "min_techs": 6
+  },
+  {
+    "id": "gunpowder",
+    "name": "Gunpowder",
+    "index": 3,
+    "year_start": 1450,
+    "year_end": 1700,
+    "advance_cost": {
+      "food": 900,
+      "timber": 600,
+      "metal": 600,
+      "wealth": 750,
+      "knowledge": 300
+    },
+    "min_techs": 9
+  },
+  {
+    "id": "enlightenment",
+    "name": "Enlightenment",
+    "index": 4,
+    "year_start": 1700,
+    "year_end": 1850,
+    "advance_cost": {
+      "food": 1200,
+      "timber": 800,
+      "metal": 800,
+      "wealth": 1000,
+      "knowledge": 450
+    },
+    "min_techs": 12
+  },
+  {
+    "id": "industrial",
+    "name": "Industrial",
+    "index": 5,
+    "year_start": 1850,
+    "year_end": 1940,
+    "advance_cost": {
+      "food": 1500,
+      "timber": 1000,
+      "metal": 1000,
+      "wealth": 1250,
+      "knowledge": 600
+    },
+    "min_techs": 15
+  },
+  {
+    "id": "modern",
+    "name": "Modern",
+    "index": 6,
+    "year_start": 1940,
+    "year_end": 1980,
+    "advance_cost": {
+      "food": 1800,
+      "timber": 1200,
+      "metal": 1200,
+      "wealth": 1500,
+      "knowledge": 750,
+      "oil": 150
+    },
+    "min_techs": 18
+  },
+  {
+    "id": "information",
+    "name": "Information",
+    "index": 7,
+    "year_start": 1980,
+    "year_end": 2015,
+    "advance_cost": {
+      "food": 2100,
+      "timber": 1400,
+      "metal": 1400,
+      "wealth": 1750,
+      "knowledge": 900,
+      "oil": 300
+    },
+    "min_techs": 21
+  },
+  {
+    "id": "autonomous_2026",
+    "name": "Autonomous 2026",
+    "index": 8,
+    "year_start": 2015,
+    "year_end": 2026,
+    "advance_cost": {
+      "food": 2400,
+      "timber": 1600,
+      "metal": 1600,
+      "wealth": 2000,
+      "knowledge": 1050,
+      "oil": 450,
+      "silicon": 120
+    },
+    "min_techs": 24
+  }
+]

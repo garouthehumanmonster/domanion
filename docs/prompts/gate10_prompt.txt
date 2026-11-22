@@ -1,0 +1,558 @@
+<USER_REQUEST>
+Our last gate was **Gate 09** (SDL3 + OpenGL 4.6 + VRAM ledger + shaders), and this is **Gate 10**: RTS camera, CDLOD terrain and ocean. I can't see your terminal, so I'm assuming Gate 09 ended with `13/13` render tests and a PPM OK. If it didn't, paste the failure first, because this gate builds on it.
+
+This is the first gate where you'll see the actual world. Paste everything below into a **new** Antigravity task.
+
+```
+GATE 10 — RTS CAMERA + CDLOD TERRAIN + OCEAN
+Project: DOMINION 2026 (ron2026). Read GEMINI.md first. This gate renders the real
+theatre (continent_2026.thtr) with a Rise-of-Nations-style camera, CDLOD terrain and an
+ocean, on top of the Gate 09 foundation. No shadows, no models, no fog of war yet.
+
+PRECONDITIONS (verify first; stop and report if any fail):
+- Gates 01-09 exist. `ron_tests` passes (same total as at the end of Gate 09) and
+  `ron_render_tests` passes 13/13, in both builds (same two build dirs as before).
+- These files exist: assets/compiled/theatres/continent_2026.thtr,
+  assets/compiled/textures/textures_2026.tex26. If missing, run the Gate 06 / Gate 08
+  bake commands (docs/asset_contracts.md).
+
+====================================================================
+§0 RULES (non-negotiable)
+====================================================================
+0.1  Read before writing code: GEMINI.md, docs/render_contracts.md, docs/asset_contracts.md,
+     src/sim/theatre_data.hpp, src/assets/texture_data.hpp, src/render/gl_objects.hpp,
+     src/render/shader_library.*, src/render/gl_bindings.hpp, src/render/persistent_ring.hpp,
+     src/render/ron_view_main.cpp, tests/render/gl_fixture.*, tests/render/test_frame.cpp
+     (copy its way of making GL tests and locating the assets directory).
+0.2  Build and run tests after EVERY group (A..E), in both builds.
+0.3  Never weaken a test. If a number in this spec is provably impossible, STOP, quote the
+     spec line, fix code AND test, log it in docs/spec_deviations.md.
+0.4  Only these TUNABLES may be adjusted without a deviation entry:
+       - SKIRT_DEPTH_M = 10.0 (allowed 10..40)
+       - the biome->layer table values in terrain_materials.hpp (data decision, see B3)
+       - ocean/terrain colour constants (visual only; tests must still pass)
+     Nothing else. LOD ranges, camera constants and grid sizes are NOT tunable.
+0.5  Do not modify earlier gates' source, EXCEPT these additive-only edits (existing
+     behaviour and all 13 Gate 09 tests must stay unchanged):
+       src/render/gl_bindings.hpp (append defines), src/render/shader_library.* (append
+       ProgramIds), src/render/ron_view_main.cpp (Group E), src/render/gl_objects.cpp (only
+       if upload_level lacks R16/R8 support, see C2), CMake lists, docs/, GEMINI.md.
+0.6  GL calls only in src/render and tests/render. DSA only (glCreate*/glNamed*/glTexture*/
+     glVertexArray*). Per-frame functions are marked "// FRAME-SAFE" and allocate nothing.
+     std::vector/std::string only in init paths.
+0.7  src/render links ron_core, ron_assets, ron_sim (for TheatreData) and glad/SDL3. Only
+     src/render/terrain_source.cpp may include theatre_data.hpp / texture_data.hpp.
+0.8  Project code: 0 warnings. float/double allowed in src/render.
+
+====================================================================
+§1 LOCKED DECISIONS
+====================================================================
+WORLD / HEIGHT
+- World is [0,4096) m in X and Z; +X east, +Z south, +Y up (right-handed). Camera looks
+  down -Z in view space.
+- Height code u16 -> metres: h = -128 + 640 * code / 65535. Sea level code 13107 -> exactly
+  0.0 m (13107/65535 = 0.2). VERIFY this against theatre_data.hpp / docs/asset_contracts.md;
+  if the repo documents a different formula STOP and report it.
+- Height field is N x N (N = 512, 1024 or 2048; real file default 2048), square. SAMPLE
+  CONVENTION (Gate 10 decision, same on CPU and GPU): texel (i,j) is centred at world
+  ((i+0.5)*cell, (j+0.5)*cell), cell = 4096/N; bilinear between texel centres, clamp-to-edge.
+  (The sim's own height query may differ by up to half a cell; document, do not change.)
+- Terrain mesh covers the WHOLE world including sea floor. Ocean is a flat plane at y = 0.
+
+CAMERA (constants in camera_rts.hpp)
+  CAM_DIST_MIN 30, CAM_DIST_MAX 1500 (metres, eye-to-focus distance), CAM_FOV_Y_DEG 45,
+  CAM_NEAR 1.0, CAM_FAR 16000, CAM_PITCH_NEAR_DEG 28 (at dist 30), CAM_PITCH_FAR_DEG 62 (at
+  dist 1500). pitch(dist) = lerp(28,62,t) deg with t = ln(dist/30)/ln(1500/30), clamped 0..1.
+  Yaw 0 looks NORTH (-Z); yaw +90 deg looks EAST (+X) (clockwise seen from above).
+  Horizontal forward f_h = (sin yaw, 0, -cos yaw); right r_h = (cos yaw, 0, sin yaw).
+  eye = focus - f_h*dist*cos(pitch) + (0, dist*sin(pitch), 0), focus = (x, y, z) with y = ground
+  height under the focus clamped to >= 0.
+- REVERSE-Z projection (column-major, right-handed view, GL_ZERO_TO_ONE clip control):
+    f = 1/tan(fovy/2); A = n/(f_far - n); B = n*f_far/(f_far - n)
+    m[0]=f/aspect, m[5]=f, m[10]=A, m[11]=-1, m[14]=B, all others 0.
+  depth(z_view_distance d) = A + B/d. depth(near)=1, depth(far)=0.
+
+TERRAIN (CDLOD)
+- Leaf node = 32 m. 8 levels: level L node size = 32*2^L m (L = 0..7; level 7 = whole world,
+  one root). Level L has (128 >> L)^2 nodes.
+- ONE shared grid mesh for all nodes: 16x16 quads (17x17 vertices) PLUS a skirt ring ->
+  19x19 = 361 vertices, 18x18 quads = 648 triangles = 1944 u16 indices. No vertex buffer:
+  vertex shader derives (gi,gj) from gl_VertexID: gi = id%19 - 1, gj = id/19 - 1 (range
+  -1..17). Skirt vertex = gi or gj outside 0..16: position uses clamp(gi,0,16) etc. and
+  y -= SKIRT_DEPTH_M. Triangles per quad (a=(i,j), b=(i+1,j), c=(i,j+1), d=(i+1,j+1), with
+  gi increasing toward +X and gj toward +Z): (a,c,b) and (b,c,d) (counter-clockwise seen
+  from +Y). Face culling stays DISABLED for terrain and ocean.
+- LOD ranges (metres): range[L] = 96 * 2^L for L = 0..6; range[7] = 1.0e9.
+- Node selection (exact algorithm, recursive, depth <= 8):
+    select(node, L):  // returns false if node is outside range[L]
+      if !sphere_hits_aabb(cam, range[L], node.aabb) return false
+      if frustum && !frustum_hits_aabb(node.aabb) return true       // culled, nothing to draw
+      if L == 0 { add(node, 0); return true }
+      if !sphere_hits_aabb(cam, range[L-1], node.aabb) { add(node, L); return true }
+      for each child c (z-major, x-minor order): if !select(c, L-1) add(c, L-1)
+      return true
+  sphere_hits_aabb(p, r, box) = aabb_dist_sq(p, box) <= r*r (3D distance, closed box).
+  Node AABB = [x, x+size] x [minh, maxh] x [z, z+size]; minh/maxh per node precomputed from
+  the height texels covering the node expanded by 1 texel on every side (clamped), so the
+  box conservatively contains every bilinear height inside the node.
+  Capacity MAX_SELECTED = 2048 nodes; on overflow stop adding and set overflow = true.
+- Vertex morph (in terrain.vert), per vertex with grid coord g (float 0..16 after clamp):
+    p = node.xz + g*cell (cell = size/16); h0 = height(p); d = length((p.x,h0,p.y) - cam)
+    rp = (L==0 ? 0 : range[L-1]); r = range[L]; ms = mix(rp, r, 0.6)
+    morph = clamp((d - ms)/(r - ms), 0, 1)
+    g -= fract(g*0.5)*2.0*morph;  p = node.xz + g*cell;  h = height(p); if skirt h -= SKIRT
+- Terrain heights come from ONE R16 texture (u_height, mips = 1, linear, clamp). GL_R16 is
+  UNORM so sampled value = code/65535 and height = -128 + 640*value (RON_HEIGHT_MIN /
+  RON_HEIGHT_RANGE defines).
+- Materials: biome map (R8 texture, any size w x h, texelFetch) -> 4-texel bilinear blend of
+  layer indices via table; 8-layer texture arrays from the Gate 08 .tex26: ids 4 terrain_albedo
+  (BC1_SRGB), 5 terrain_normal (BC5), 6 terrain_rh (BC1, linear). Tiled by WORLD xz:
+  detail tile 12 m, macro tile 71 m (albedo = detail * (0.65 + 0.7*luma(macro))). Slope
+  override: weight smoothstep(0.82, 0.70, geometric_normal.y) toward the ROCK layer.
+  Normal = whiteout blend of geometric normal (central differences of the height texture at
+  +-1 texel) and the tangent-space BC5 normal mapped as: tangent u = +X, bitangent v = +Z,
+  detail_world = (t.x, t.z, t.y) in (x,y,z); n = normalize(vec3(Ng.x + t.x, Ng.y * t.z, Ng.z + t.y)).
+  t.xy = rg*2-1, t.z = sqrt(max(0, 1 - dot(t.xy,t.xy))).
+- Lighting (placeholder until Gate 13): radiance = albedo * ( sun_color*sun_intensity*max(n.L,0)/PI
+  + ambient ), ambient = mix((0.15,0.13,0.10), (0.35,0.45,0.60), n.y*0.5+0.5) * 0.6.
+  Distance fog: f = 1 - exp(-d*0.0003); colour = mix(colour, (0.50,0.62,0.80), f).
+
+OCEAN
+- Single flat quad at y = 0 spanning [-20000, 24096] in X and Z (4 vertices, triangle strip,
+  position from gl_VertexID), depth test GREATER, depth WRITE OFF, premultiplied blend
+  (ONE, ONE_MINUS_SRC_ALPHA).
+- Water depth = max(depth_fine, depth_coarse): depth_fine = max(0, -height) from the height
+  texture; depth_coarse from a CPU-built "ocean depth map" (see B5), R8 512x512, value/255*120 m.
+  Outside the world rectangle depth = 120. This makes shores readable even if the sea floor is
+  flat. Colour: base = mix((0.02,0.30,0.32), (0.005,0.045,0.11), 1-exp(-depth*0.08));
+  alpha = clamp(1-exp(-depth*1.2), 0.35, 1). Four analytic sine waves perturb the NORMAL
+  only (no vertex displacement). Fresnel Schlick F0 = 0.02, sky reflection mix(horizon
+  (0.55,0.68,0.85), zenith (0.18,0.32,0.65), clamp(r.y,0,1)), sun glint pow(n.h, 800). Shore
+  foam where depth < 1.2 m. Same fog as terrain, alpha = mix(alpha, 1, fog).
+
+VRAM (via the Gate 09 ledger; everything reserved before freeze):
+  height R16 NxN + biome R8 -> TerrainMaps; the 3 terrain arrays -> TerrainTextures;
+  ocean depth map -> Ocean; node ring + params UBO + index buffer -> TerrainMaps.
+
+New binding defines (append to the X-macro list in gl_bindings.hpp):
+  BIND_UBO_TERRAIN=1, BIND_SSBO_TERRAIN_NODES=4, TEX_TERRAIN_HEIGHT=1, TEX_TERRAIN_BIOME=2,
+  TEX_TERRAIN_ALBEDO=3, TEX_TERRAIN_NORMAL=4, TEX_TERRAIN_RH=5, TEX_OCEAN_DEPTH=6,
+  RON_HEIGHT_MIN=-128.0, RON_HEIGHT_RANGE=640.0.
+
+TerrainUbo (std140, binding BIND_UBO_TERRAIN), C++ struct must be exactly 192 bytes:
+    float lod_range[8];                         // as vec4 u_lod_range[2]
+    float skirt_depth, rock_layer, tex_n, inv_n; // vec4 u_tparams0
+    float biome_w, biome_h, ocean_depth_max, pad;// vec4 u_tparams1   (ocean_depth_max = 120)
+    u32   biome_layer[32];                      // uvec4 u_biome_layer[8], id -> [id>>2][id&3]
+
+New ProgramIds (append): Terrain (terrain.vert + terrain.frag), TerrainDebugFlat (same files,
+define TERRAIN_DEBUG_FLAT: both stages as normal geometry but the fragment outputs exactly
+vec4(1,1,1,1) immediately), TerrainDebugLod (define TERRAIN_DEBUG_LOD: tint albedo by node
+level, 8 distinct hues), Ocean (ocean.vert + ocean.frag).
+
+====================================================================
+GROUP A — Math, height sampler, RTS camera
+====================================================================
+Files: src/render/rmath.hpp/.cpp, height_sampler.hpp/.cpp, camera_rts.hpp/.cpp,
+       frame_fill.hpp/.cpp, tests/render/test_camera.cpp. Add to ron_render sources and to
+       ron_render_tests. These tests need NO GL context (they must not call test_gl()).
+
+A1. rmath (namespace ron::render): Vec3 {float x,y,z} with add, sub, mul(scalar), dot, cross,
+    length, normalize. Mat4 { float m[16]; } column-major, m[c*4+r]. Functions:
+    mat4_identity, mat4_mul(a,b) (= a*b), mat4_look_at(eye,target,up) (right-handed, glm
+    lookAtRH layout: rows s,u,-f, translation -dot(s,eye), -dot(u,eye), +dot(f,eye)),
+    mat4_perspective_reverse_z(fovy_rad, aspect, n, f) per §1, bool mat4_inverse(const Mat4&,
+    Mat4&) (cofactor/adjugate in DOUBLE, cast to float; false if |det| < 1e-30),
+    Vec3 transform_point(const Mat4&, Vec3) (affine, w ignored), void project(const Mat4&, Vec3,
+    float out_ndc[3]) (full clip -> divide by w).
+    struct Plane {float a,b,c,d;} (normalised, inside = a*x+b*y+c*z+d >= 0).
+    struct Frustum { Plane p[6]; } order: left, right, bottom, top, near, far.
+    Frustum frustum_from_view_proj(const Mat4&): with row_i(j) = M.m[j*4+i]:
+      left = row3+row0, right = row3-row0, bottom = row3+row1, top = row3-row1,
+      near = row3-row2, far = row2 (reverse-Z, ZERO_TO_ONE); normalise by |(a,b,c)|.
+    bool frustum_hits_aabb(const Frustum&, Vec3 mn, Vec3 mx) (p-vertex test; FRAME-SAFE).
+    void unproject_ray(const Mat4& inv_view_proj, float ndc_x, float ndc_y, Vec3& origin, Vec3& dir):
+      near point = ndc z 1, far point = ndc z 0, computed in double, origin = near point,
+      dir = normalize(far - near).
+A2. height_sampler.hpp: float height_code_to_m(u16); u16 height_m_to_code(float) (round, clamp
+    0..65535). class HeightSampler { void init(const u16* codes, u32 n); // NOT owning; scans
+    min/max; u32 n() const; float cell_m() const; u16 code(i32 i, i32 j) const (clamped);
+    float height_m(float x, float z) const (texel-centre bilinear, clamp; FRAME-SAFE);
+    float min_m() const; float max_m() const; }.
+    bool pick_terrain(const HeightSampler&, Vec3 origin, Vec3 dir, float max_dist, Vec3& hit):
+    march t from 0 with step = clamp(0.002*t, 0.5, 4.0) m; stop (false) if the sample point leaves
+    [0,4096) in X or Z; the first step where ray.y < height_m is a hit; refine with 16 bisection
+    steps between the last above and first below point; false if the origin is already below
+    terrain. FRAME-SAFE.
+A3. camera_rts.hpp:
+      struct CameraRts { float target_x, target_z, target_yaw, target_dist;
+                         float x, z, yaw, dist, y; };   // x,z,yaw,dist = smoothed current; y = focus ground height
+      struct CameraInput { float pan_x, pan_z, rotate, zoom_steps; }; // pan_x +right, pan_z +forward, rotate +yaw, zoom_steps + = zoom in
+      void camera_init(CameraRts&, float x, float z, float yaw, float dist); // targets = current, y = 0
+      void camera_snap(CameraRts&, const HeightSampler*);  // current = target, y from sampler
+      void camera_update(CameraRts&, const CameraInput&, float dt, const HeightSampler*); FRAME-SAFE
+      float camera_pitch(float dist);                       // radians
+      Vec3 camera_eye(const CameraRts&, const HeightSampler*);
+      Mat4 camera_view(const CameraRts&, const HeightSampler*);
+      Mat4 camera_proj(float aspect);
+    camera_update rules: pan speed = 0.9 * target_dist metres/second; target focus +=
+    (r_h*pan_x + f_h*pan_z) * speed * dt using target_yaw; target focus clamped to [0, 4095.99];
+    target_yaw += rotate * 1.6 rad/s * dt; target_dist = clamp(target_dist * pow(0.85, zoom_steps),
+    30, 1500); smoothing for x, z, yaw, dist: cur += (target - cur) * (1 - exp(-12*dt)); y:
+    cur_y += (max(0, sampler->height_m(x,z)) - cur_y) * (1 - exp(-8*dt)) (if sampler null, y = 0).
+    camera_eye: eye as in §1; then if sampler non-null: eye.y = max(eye.y, max(0,
+    sampler->height_m(eye.x, eye.z)) + 4.0). camera_view = look_at(eye, (x, y, z), (0,1,0)).
+A4. frame_fill.hpp: void fill_frame_uniforms(FrameUniforms&, const Mat4& view, const Mat4& proj,
+    Vec3 cam_pos, u32 w, u32 h, float time_s, float sim_tick, float interp_alpha, Vec3 sun_dir
+    (normalised by the function), float sun_intensity, Vec3 sun_color). Fills view, proj,
+    view_proj = proj*view, inv_view_proj (double inverse), cam_pos.xyz, screen = (w, h, 1/w, 1/h),
+    time = (t, tick, alpha, 0), sun_dir.xyz + w = intensity, sun_color.rgb. Zero all padding.
+A5. tests/render/test_camera.cpp — 4 tests:
+    14 Height_Sampler: code<->metres: code 13107 -> 0.0 (|err|<1e-4), 0 -> -128, 65535 -> 512;
+       height_m_to_code(0.0)==13107, (-128)==0, (512)==65535. Synthetic N=8 heightmap with
+       code(i,j) = 13107 + 1000*i: for i in 0..7 height_m at x=(i+0.5)*512 (any z) equals
+       height_code_to_m(13107+1000*i) within 1e-3; at x=(i+1)*512 (i<7) it equals the mean of
+       texels i and i+1 within 1e-3; x=-50 equals texel 0, x=4200 equals texel 7; z has no effect.
+       min_m/max_m equal the extreme texel heights. Vertical ray: pick_terrain from (1000,500,2000)
+       dir (0,-1,0) on a flat 0 m map -> hit.y within 0.01 of 0 and hit.x,z unchanged; a ray
+       pointing up -> false; origin below terrain (flat 100 m map, origin y=50) -> false.
+    15 Cam_Matrices: camera at focus (1000,*,2000), y=0, dist 200: yaw 0 -> eye ==
+       (1000, 200 sin p, 2000 + 200 cos p) within 1e-3 with p = camera_pitch(200); yaw = pi/2 ->
+       eye == (1000 - 200 cos p, 200 sin p, 2000) within 1e-3. view*focus == (0,0,-200) within
+       1e-3 (both yaws). camera_pitch(30) == 28 deg, camera_pitch(1500) == 62 deg, camera_pitch
+       (sqrt(30*1500)) == 45 deg (each within 0.01 deg), strictly increasing over 20 sample
+       distances, clamped outside [30,1500]. Projection (aspect 16/9): view-space point
+       (0,0,-1) -> ndc z == 1 (1e-5); (0,0,-16000) -> 0 (1e-5); (0,0,-100) -> A + B/100 (1e-6);
+       the point (tan(fovy/2)*aspect*d, 0, -d), d = 300 -> ndc.x == 1 (1e-5); same for y with
+       (0, tan(fovy/2)*d, -d). mat4_inverse: for view_proj of the camera, in DOUBLE
+       multiplication M * inv(M) is identity within 1e-3 absolute; inverse of a singular
+       (all-zero) matrix returns false. fill_frame_uniforms: screen == (1600,900,1/1600,1/900),
+       view_proj == proj*view elementwise (1e-4 relative-or-absolute), padding zero
+       (memcmp the 4th component of time via .w == 0), sizeof(FrameUniforms) still 336.
+    16 Cam_Control: flat sampler (N=8, all codes 13107). camera_init at (2048,2048), yaw 0, dist
+       300, snap. pan_z=+1 for 60 updates at dt=1/60: target_z == 2048 - 270 within 0.05, target_x
+       unchanged within 1e-3. After 240 more zero-input updates: |z - target_z| < 0.01. New
+       camera with yaw set to pi/2 (set target_yaw and yaw directly), pan_z=+1 for 30 updates:
+       target_x == 2048 + 135 within 0.05, |target_z - 2048| < 0.05. pan_x=+1 at yaw 0 moves
+       target_x by +270 per second. rotate=+1 for 60 updates: target_yaw == 1.6 within 1e-3.
+       zoom_steps=+1 once: target_dist == 255 (300*0.85) within 1e-3; zoom_steps=+100 (single
+       call) clamps to 30; -100 clamps to 1500. Pan west at yaw -pi/2... simply: set
+       target_x = 1, pan_x = -1 for 120 updates with yaw 0 -> target_x == 0; pan_x=+1 for 6000
+       updates -> target_x <= 4095.99 and >= 4095. Determinism: two identical cameras fed the
+       same 500-step input sequence (derived from a fixed LCG) are bitwise equal (memcmp).
+       Eye lift: sampler N=8 with every code = height_m_to_code(100): camera_eye(...).y >=
+       104 - 0.01 even at dist 30.
+    17 Cam_PickFrustum: flat 0 m sampler; camera focus (2048,2048) dist 200 yaw 0.7, snapped.
+       Build view, proj (16:9), view_proj, its inverse. Use viewport w=1601, h=901; pixel
+       (800,450) has ndc exactly (0,0) using ndc_x = (px+0.5)/w*2-1, ndc_y = 1-(py+0.5)/h*2.
+       unproject_ray at ndc(0,0): the point-to-line distance from the focus (2048,0,2048) to
+       the ray < 0.01. pick_terrain along that ray -> hit within 0.05 of the focus. Pixel (1200,
+       200): pick hits y==0 (0.01) and project(view_proj, hit) gives ndc equal to that pixel's
+       ndc within 1e-3. Frustum: with F = forward unit vector (focus - eye normalised), R = right:
+       focus inside (point test via planes); eye - F*10 outside; eye + F*17000 outside; eye +
+       F*100 + R*5000 outside; AABB centred on focus half-size 5 -> hits; AABB centre focus +
+       (20000,0,0) half-size 5 -> not hit; AABB centre focus half-size 2000 -> hits; AABB entirely
+       behind the eye -> not hit.
+CHECK A: both builds; ron_render_tests 17/17 (13 old + 4 new). ron_tests unchanged.
+
+====================================================================
+GROUP B — Quadtree, CDLOD selection, mesh indices, ocean map, material table, adapters (CPU only)
+====================================================================
+Files: src/render/terrain_quadtree.hpp/.cpp, terrain_materials.hpp, terrain_source.hpp/.cpp,
+       tests/render/scene_fixture.hpp/.cpp (data part only for now), test_terrain_cpu.cpp,
+       test_cdlod.cpp.
+
+B1. terrain_quadtree.hpp (namespace ron::render):
+      constexpr u32 TERRAIN_LEVELS=8, TERRAIN_ROOT_LEVEL=7, TERRAIN_MAX_SELECTED=2048,
+        TERRAIN_GRID_QUADS=16, TERRAIN_GRID_VERTS=19, TERRAIN_INDEX_COUNT=1944,
+        TERRAIN_VERTEX_COUNT=361; constexpr float TERRAIN_LEAF_M=32, SKIRT_DEPTH_M=10.0f;
+      struct TerrainNodeGpu { float x, z, size, level; };  static_assert(sizeof==16)
+      float terrain_lod_range(u32 level);          // §1
+      float aabb_dist_sq(Vec3 p, Vec3 mn, Vec3 mx); // 0 inside the box; FRAME-SAFE
+      class TerrainQuadtree { bool build(const HeightSampler&); // init path, allocates
+         u32 dim(u32 level) const; // 128 >> level
+         void bounds(u32 level, u32 ix, u32 iz, float& minh, float& maxh) const; };
+         Build: level 0 by scanning the texel rectangle described in §1 (node rect in texel
+         space: i0 = floor(x0/cell - 0.5) - 1, i1 = ceil((x0+32)/cell - 0.5) + 1, clamped; same
+         for j); higher levels = min/max over the 4 children.
+      struct SelectResult { u32 count; bool overflow; };
+      SelectResult cdlod_select(const TerrainQuadtree&, const Frustum* frustum_or_null,
+                                Vec3 cam, TerrainNodeGpu* out, u32 capacity); // FRAME-SAFE, §1 algorithm
+      u32 terrain_build_indices(u16* out, u32 capacity); // fills 1944 indices per §1, returns count
+      void ocean_depth_map_build(const HeightSampler&, u8* out /*512*512*/); // init path
+         Cell (i,j) is 8 m; centre ((i+0.5)*8,(j+0.5)*8); land iff height_m(centre) > 0.0.
+         Two-pass chamfer distance in CELLS (weights 1 and 1.41421356; forward pass neighbours
+         W,NW,N,NE; backward pass E,SE,S,SW; land = 0, sea = 1e9 initially). depth_m =
+         min(0.12 * dist_cells * 8, 120); out = round(depth_m / 120 * 255); land cells 0; if there
+         is no land at all every cell is 255.
+B2. terrain_source.hpp/.cpp: the ONLY adapter to Gate 05-08 loaders.
+      struct TerrainSource { const u16* height; u32 height_n; const u8* biome; u32 biome_w, biome_h; };
+      bool terrain_source_from(const TheatreData&, TerrainSource&);   // adapt to the real API
+      struct TerrainTexLevel { const void* data; u64 bytes; };
+      bool terrain_tex_level(const TextureData&, u32 tex_id, u32 level, u32 layer, TerrainTexLevel&);
+      Level data layout is level-major then layer (Gate 08 contract); use the loader's real
+      accessors. If the BIOME section is not a plain 8-bit array, or the HEIGHT section is not
+      N x N u16, STOP and report what it is. If the data is not 2-byte aligned on a u16 pointer,
+      copy into aligned storage owned by a small struct.
+B3. terrain_materials.hpp: read tools/theatre_baker (biome id list) and tools/texture_baker
+    (terrain layer names/order, the 8 layers of ids 4/5/6) and docs. Define:
+      constexpr u8 BIOME_TO_LAYER[32]  // index = Gate 06 biome id; unused ids -> layer 0
+      constexpr u8 ROCK_LAYER          // the layer that is rock/cliff
+      constexpr const char* TERRAIN_LAYER_NAMES[8]
+    Choose each mapping by matching biome names to layer names (water/sea/shore biomes map to the
+    sand/seabed-like layer). Document the table (biome id, biome name, layer index, layer name)
+    in docs/render_contracts.md. If no sensible rock layer exists, STOP and report the layer list.
+B4. scene_fixture (data part): `const TheatreData& test_theatre()`, `const TextureData& test_tex26()`,
+    `const TerrainSource& test_source()`, `const HeightSampler& test_sampler()`,
+    `const TerrainQuadtree& test_quadtree()` — each lazily loaded ONCE from the assets directory
+    (same location logic as other tests); failures -> test failure with message "run the Gate 06/08 bake".
+B5. tests/render/test_terrain_cpu.cpp — 3 tests (no GL):
+    18 Terrain_RealData: source loads; height_n in {512,1024,2048}; sampler min >= -128 and max
+       <= 512; fraction of texels with code > 13107 is within [0.35, 0.55]; log min/max/land
+       fraction/biome dims; every biome byte present in the biome map is < 32 and
+       BIOME_TO_LAYER[id] < 8; ROCK_LAYER < 8; the 3 terrain arrays exist in the tex26 with 8
+       layers and the expected formats (BC1 srgb flag, BC5, BC1); terrain_tex_level returns non-null
+       data with bytes > 0 for (id 4,level 0,layer 7), (id 5,level 9,layer 0), (id 6,level 5,layer 3).
+    19 Terrain_Quadtree: build on the real sampler. For 300 pseudo-random (LCG, fixed seed)
+       (level, ix, iz) picks and 50 random points per pick inside the node's xz rectangle:
+       height_m is within [minh - 1e-3, maxh + 1e-3]. Root bounds equal sampler min_m/max_m within
+       1e-3. For every node of level L>0 minh == min over its 4 children and maxh == max.
+       dim(0)==128, dim(7)==1. terrain_build_indices: returns 1944; every index < 361; with vertex
+       id = (gj+1)*19 + (gi+1), exactly 512 triangles have all three vertices inside gi,gj in 0..16
+       and each has positive signed area (viewed from +Y, i.e. area computed in (x, -z)) equal
+       to 0.5 grid cells^2; the remaining 136 triangles have zero xz-area. Ocean map on a synthetic
+       N=64 sampler (columns 0..31 code = height_m_to_code(50), columns 32..63 code =
+       height_m_to_code(-10)): find c0 = first column in row 100 where height_m(cell centre) <= 0;
+       cells in that row with column < c0 are 0; for k in {0, 39, 200} the value at column c0+k equals
+       round(min(0.12*8*(k+1),120)/120*255) within +-1; the all-sea case (every code = height_m_to_code(-50))
+       gives 255 everywhere; the map has size 512*512.
+    20 (no new test; see test_cdlod below)
+B6. tests/render/test_cdlod.cpp — 2 tests (no GL), on the real quadtree/sampler:
+    20 Cdlod_Cover: (a) no culling, six cameras: (2048,100,2048), (10,50,10), (4000,300,100),
+       (-500,800,2000), (2048,2000,2048), (1000,5,3000): result.overflow false, count in
+       [1, 2048]; rasterising every node onto the 128x128 leaf-cell grid (node of level L covers
+       2^L x 2^L cells at (x/32, z/32)) marks EVERY cell exactly once (exact tiling, no overlap,
+       no hole). (b) with culling: for focus points {world centre (2048,2048), the flattest land
+       point (scan land texels at 32 m stride with height > 5 m; choose minimal max |h - mean|
+       over a 9x9 neighbourhood at 8 m spacing)}, dist in {100, 400, 1200}, yaw {0, 2.3}: build
+       camera (snapped, with sampler), view_proj, frustum, select with culling. For a 32x18 grid of
+       pixel centres: pick_terrain along the unprojected ray; if the hit is inside the world, its xz
+       lies in EXACTLY ONE selected node rectangle (half-open [x,x+size) x [z,z+size)). At least
+       95% of the pixels must produce an in-world hit for these poses. Pairwise, selected node
+       rectangles never overlap (xz) in any of the culled selections. Culled count <= unculled
+       count for the same camera position.
+    21 Cdlod_Invariants: (a) for unculled selections from the six cameras above: every node with
+       level k>0 has aabb_dist_sq(cam, box) > range[k-1]^2 (using the same function and node AABBs
+       from the quadtree). (b) Let (px,pz) be the world xz of the highest texel and H = sampler
+       max_m. For camera y = H + 20 + s*(3000/11), s = 0..11, at (px,pz): the finest (minimum) level
+       in the selection is non-decreasing in s, equals 0 for s = 0, and is >= 5 for s = 11.
+       (c) Determinism: two calls give byte-identical output. (d) 20 pseudo-random cameras with
+       culling and a pose cycling through the Group A poses never overflow and never exceed 2048
+       nodes. (e) Capacity guard: calling with capacity 10 returns count == 10 and overflow == true,
+       and a canary node at out[10] is untouched. (f) Perf: median of 200 timed cdlod_select calls
+       (after 20 warm-ups; camera (2048,300,2048), no culling) < 2.0 ms; print the median.
+CHECK B: both builds; ron_render_tests 22/22. Print the Terrain_RealData log line (N, min/max,
+         land fraction, biome dims) and the Cdlod perf median.
+
+====================================================================
+GROUP C — Terrain renderer (GPU)
+====================================================================
+Files: src/render/terrain_renderer.hpp/.cpp, assets/shaders/common/terrain_common.glsl,
+       terrain.vert, terrain.frag, gl_bindings/shader_library additions, scene_fixture (GL part),
+       tests/render/test_terrain_gpu.cpp.
+
+C1. Bindings + ProgramIds exactly as §1 (Terrain, TerrainDebugFlat, TerrainDebugLod added now; Ocean
+    is added in Group D). The Gate 09 test Shader_Programs iterates all ProgramIds, so every program
+    must compile and link.
+C2. terrain_renderer.hpp: class TerrainRenderer {
+      bool init(VramLedger&, const TerrainSource&, const TextureData&, const HeightSampler&,
+                const TerrainQuadtree&);    // creates & uploads everything below
+      void frame_begin(const Vec3& cam_pos, const Frustum&);  // FRAME-SAFE: ring.begin_frame(), cdlod_select
+                                                              // straight into the mapped slot (capacity 2048), remembers count
+      void draw_terrain(u32 program /* ProgramId handle from the library */);  // FRAME-SAFE
+      void frame_end();                                       // FRAME-SAFE: ring.end_frame()
+      u32 node_count() const; u32 triangle_count() const;     // count * 648
+      bool overflowed() const; void destroy(); }
+    Resources: height R16 NxN (mips 1) uploaded from TerrainSource; biome R8; terrain_albedo
+    BC1_SRGB / terrain_normal BC5 / terrain_rh BC1 as 8-layer 2D arrays with ALL mips (10) uploaded via
+    GpuTexture::upload_level(level, layer, ...) using terrain_tex_level; wrap mode REPEAT on S and T
+    for the three arrays (glTextureParameteri after creation); node ring = PersistentRing (2048*16
+    bytes per frame, TerrainMaps); TerrainUbo (192 B) in an immutable GpuBuffer filled from
+    terrain_lod_range, SKIRT_DEPTH_M, ROCK_LAYER, BIOME_TO_LAYER; index buffer (1944 u16) as GpuBuffer;
+    own VAO (glCreateVertexArrays + glVertexArrayElementBuffer, no attributes). Before uploading R8
+    data call glPixelStorei(GL_UNPACK_ALIGNMENT, 1). Check that GpuTexture::upload_level supports R16
+    (GL_RED, GL_UNSIGNED_SHORT) and R8 (GL_RED, GL_UNSIGNED_BYTE); if it does not, add exactly
+    those mappings in gl_objects.cpp (additive) and re-run the Gate 09 tests.
+    draw_terrain: glUseProgram(program); bind UBO_TERRAIN (BIND_UBO_TERRAIN), node ring range as
+    SSBO BIND_SSBO_TERRAIN_NODES, textures to units TEX_TERRAIN_HEIGHT/BIOME/ALBEDO/NORMAL/RH (glBindTextureUnit);
+    glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glEnable(GL_DEPTH_TEST); glDepthFunc(GL_GREATER);
+    glDepthMask(GL_TRUE); glBindVertexArray(vao); glDrawElementsInstanced(GL_TRIANGLES, 1944,
+    GL_UNSIGNED_SHORT, 0, node_count). The caller binds the frame UBO and the framebuffer.
+C3. Shaders (follow §1 exactly). terrain_common.glsl: TerrainUbo block, u_height sampler,
+    height_at(vec2 xz) (uv = xz / RON_WORLD_SIZE, textureLod level 0), lod_range(int L) =
+    u_lod_range[L>>2][L&3]. terrain.vert per §1 morph; outputs layout(location=0) out vec3 v_world,
+    layout(location=1) flat out float v_lod. terrain.frag: geometric normal from the height texture
+    central differences (offsets +-1/N in uv; dx metres = 2*cell), biome 4-corner blend
+    (f = uv*vec2(biome_w, biome_h) - 0.5; i0 = floor(f); w = fract(f); texelFetch with clamped coords;
+    if all four layers are equal use a single sample), albedo/normal/rh array fetch with
+    uv = world.xz/12 (detail) and world.xz/71 (macro, albedo only), slope rock override, lighting and
+    fog per §1, output vec4(color, 1). TERRAIN_DEBUG_FLAT and TERRAIN_DEBUG_LOD as in §1. Never output
+    NaN: guard normalize() inputs.
+C4. scene_fixture (GL part): `SceneFixture& test_scene()` lazily builds ONE: VramLedger (local,
+    not frozen), ShaderLibrary::init (disk reader), TerrainRenderer::init from the real data,
+    a frame-UBO GpuBuffer (336 B, DYNAMIC_STORAGE) and `void render_view(RenderTarget&, const
+    CameraRts&, ProgramId terrain_program, bool draw_ocean_flag, const float clear_rgba[4])`: computes
+    view/proj (aspect = w/h), fill_frame_uniforms with sun_dir (0.30,0.70,0.65), intensity 3.0, sun
+    colour (1.0,0.95,0.85), time 1.0; uploads to the UBO and binds BIND_UBO_FRAME; glDepthMask(TRUE);
+    rt.clear(clear); binds rt.fbo(), viewport; frustum from view_proj; terrain.frame_begin;
+    draw_terrain(program); (ocean only in Group D); frame_end. gl_state_init() is called once by the
+    fixture.
+C5. tests/render/test_terrain_gpu.cpp — 3 tests (GL; GL_TEST_BEGIN/END; ledger must accept
+    everything):
+    22 Terrain_Upload: read back height texel codes with glGetTextureSubImage (GL_RED,
+       GL_UNSIGNED_SHORT) at 8 fixed positions (corners, centre and 3 LCG positions) == source codes;
+       biome R8 readback at 8 positions == source; for terrain_albedo: glGetCompressedTextureSubImage
+       of layer 5 level 0 (full level) first 64 bytes == file bytes; level 9 layer 7 (8 bytes) equal;
+       same for terrain_normal (BC5, layer 2 level 0 first 64 bytes; level 9 layer 7 16 bytes);
+       terrain_rh (layer 0 level 4 first 64 bytes). Ledger: used(TerrainTextures) ==
+       gl_tex_bytes of the three arrays and <= 64 MiB; used(TerrainMaps) <= 192 MiB; the sum of all used
+       categories < 2304 MiB.
+    23 Terrain_DepthMatch: flattest land point (reuse B6's scan helper; put it in scene_fixture),
+       camera dist 120, yaw 0.7, snapped, RT 129x73 RGBA16F + depth, ProgramId::Terrain, clear colour
+       (0,0,0,1). Expected distance d_exp = -(view * hit).z where hit = pick_terrain along the centre
+       pixel ray ((64,36), ndc 0,0). GPU depth at (64,36) via glGetTextureSubImage(GL_DEPTH_COMPONENT,
+       GL_FLOAT); z_gpu = B/(depth - A). Require |z_gpu - d_exp| <= 1.0 + 0.005*d_exp. Centre colour
+       finite (no NaN/inf), alpha == 1 (1e-3), and luminance > 0.0005. renderer.overflowed() false
+       and node_count in [1, 2048].
+    24 Terrain_NoCracks: RT 256x144 RGBA16F + depth, ProgramId::TerrainDebugFlat, clear colour
+       (1,0,1,1). Four poses with focus (2048,2048): (dist 150, yaw 0), (500, 0.58), (900, pi/2),
+       (1200, -2.09). For each: read back the colour image (glGetTextureImage, GL_RGBA, GL_FLOAT) and
+       count pixels with r < 0.99 or g < 0.99 or b < 0.99 — must be 0 for all poses (whole screen is
+       inside the world for these poses, so every pixel must be white). On failure print the pose and
+       count and the first 5 failing pixel coordinates. The ONLY allowed fix is raising SKIRT_DEPTH_M
+       (max 40), otherwise STOP and report.
+CHECK C: both builds; ron_render_tests 25/25. Print node_count for the DepthMatch pose and the
+         NoCracks poses.
+
+====================================================================
+GROUP D — Ocean
+====================================================================
+Files: assets/shaders/ocean.vert, ocean.frag, ProgramId::Ocean, TerrainRenderer additions,
+       tests/render/test_ocean.cpp.
+
+D1. TerrainRenderer additions: init also builds the ocean depth map (ocean_depth_map_build into a
+    temporary std::vector<u8>, R8 512x512 GpuTexture in category Ocean, mips 1, linear, clamp) and
+    sets ocean_depth_max = 120 in the UBO; void draw_ocean(u32 program) FRAME-SAFE: bind UBO_TERRAIN,
+    height texture (TEX_TERRAIN_HEIGHT), ocean map (TEX_OCEAN_DEPTH); glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_GREATER); glDepthMask(GL_FALSE); glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4) using the terrain VAO; afterwards glDisable(GL_BLEND)
+    and glDepthMask(GL_TRUE).
+D2. ocean.vert: corners from gl_VertexID (x = (id&1) ? 24096 : -20000, z = (id>>1) ? 24096 : -20000,
+    y = 0); outputs layout(location=0) out vec3 v_world. ocean.frag per §1: depth, waves (4 directional
+    sines, wavelengths 23, 11, 5.3, 2.7 m, normal slope amplitudes 0.06, 0.04, 0.025, 0.015, phase speed
+    sqrt(9.81*2pi/wavelength) using u_time.x; amplitude of each wave divided by (1 + dist*k*0.0025)
+    with k = 2pi/wavelength), Fresnel, sky reflection, glint, foam (depth < 1.2: foam = (1 - depth/1.2) *
+    (0.5 + 0.5*sin(depth*9 - u_time.x*1.6 + 6.28*hash21(floor(world.xz*0.8))))), fog, premultiplied
+    output. Never NaN.
+D3. scene_fixture: render_view now draws the ocean after the terrain when draw_ocean_flag is true.
+D4. tests/render/test_ocean.cpp — 2 tests (GL):
+    26 Ocean_Colour: from the ocean depth map on the CPU (recompute with ocean_depth_map_build or expose
+       the stored map) pick the cell with the largest value; assert that value >= 64 (>= 30 m of coarse
+       depth) else STOP and report the max. Focus at that cell centre, dist 150, yaw 0, RT 129x73. Render
+       with ProgramId::Terrain + ocean. Centre pixel (64,36): finite, blue-dominant: b > 1.5*r and
+       b > 0.004. Also render the SAME view with a different time (render_view takes time; add a
+       parameter defaulting to 1.0; second render uses 4.0): both centre pixels finite and, since waves
+       move, the two pixels differ in at least one channel by > 1e-6 (the ocean is animated).
+    27 Ocean_DepthRule: the highest texel of the heightmap (must be >= 25 m else STOP and report): focus
+       at its centre, dist 100, yaw 0.4. Render (a) terrain only and (b) terrain + ocean into the same
+       RT (clear colour (0,0,0,1) both times). The 21x21 pixel block around the centre is bitwise
+       identical between (a) and (b) (compare as floats with memcmp), and the depth value at the centre
+       is identical (the ocean pass writes no depth). Also: render (b) once more with the camera focused
+       on a deep-sea cell (from test 26) and verify the depth at the centre pixel is IDENTICAL to a
+       terrain-only render of that view (ocean does not write depth over water either).
+CHECK D: both builds; ron_render_tests 27/27.
+
+====================================================================
+GROUP E — Viewer, docs, constitution
+====================================================================
+Files: src/render/ron_view_main.cpp (edit), tools/check_scene_ppm.py, docs/render_contracts.md,
+       GEMINI.md addition.
+
+E1. ron_view: after the Gate 09 startup add: load theatre + tex26 (paths via the same assets
+    directory logic as the tests; exit code 5 on load failure), HeightSampler, TerrainQuadtree,
+    TerrainRenderer (all before ledger.freeze()). New CLI: --focus X,Z (default 2048,2048), --dist D
+    (default 400), --yaw RADIANS (default 0.3), --lod-debug (use TerrainDebugLod instead of Terrain).
+    The HDR RenderTarget is reused: per frame: poll SDL events; read keyboard state: W/A/S/D and arrow
+    keys -> pan (W/Up = +pan_z, S/Down = -pan_z, D/Right = +pan_x, A/Left = -pan_x), Q = rotate -1, E =
+    rotate +1; mouse wheel y -> zoom_steps (wheel up zooms in); edge scroll: window focused and the
+    mouse within 4 px of an edge pans toward that edge at full speed; F2 toggles lod-debug at runtime.
+    camera_update with dt (clamped to 0.1 s) and the sampler; camera_eye/view/proj; fill_frame_uniforms
+    (sun as in C4, sim_tick 0, alpha 0); upload to the ring and bind; frustum_from_view_proj; terrain
+    frame_begin; draw terrain into the HDR target (cleared to fog colour (0.50,0.62,0.80,1) and depth
+    0.0); draw ocean; frame_end; tonemap to the default framebuffer as in Gate 09. Window title adds
+    "nodes <n> tris <t>". Printed summary adds node/tris averages and the ledger summary by category.
+    --dump keeps working (frames are rendered with the default camera). No per-frame allocation.
+E2. tools/check_scene_ppm.py <file>: parse P6; w,h > 0 and size match; mean luminance in [8, 247];
+    luminance standard deviation >= 6; print "SCENE OK <w>x<h> mean=<m> std=<s>" else the reason, exit 1.
+E3. docs/render_contracts.md: append sections: height/sample convention and the code<->metres formula;
+    camera model and constants; CDLOD (levels, ranges, algorithm, morph, skirts, mesh layout);
+    terrain/ocean binding table and TerrainUbo layout; ocean depth-map rule; biome->layer table (B3);
+    list of tests 14..27; note about the sim-vs-render half-cell height convention difference.
+E4. Append to GEMINI.md (change nothing else): "Terrain: heights are -128 + 640*code/65535 m, sea level
+    exactly 0 m; height texels are centred at (i+0.5)*cell. CDLOD: 8 levels, 32 m leaves, range[L] =
+    96*2^L m, one 19x19 skirted grid mesh; node selection lives in terrain_quadtree.cpp and its tests
+    must keep passing. Camera: yaw 0 looks north (-Z), reverse-Z, dist 30..1500 m. Ocean is a flat
+    y=0 plane drawn after terrain with depth write off. Only terrain_source.cpp may include
+    theatre_data.hpp/texture_data.hpp from src/render."
+
+====================================================================
+FINAL VERIFICATION (both builds)
+====================================================================
+1. Clean configure + build: 0 errors, 0 warnings from project code.
+2. `ron_tests` passes with the same total as before this gate.
+3. `ron_render_tests` prints 27/27. Names: the 13 from Gate 09, then Height_Sampler, Cam_Matrices,
+   Cam_Control, Cam_PickFrustum, Terrain_RealData, Terrain_Quadtree, Cdlod_Cover, Cdlod_Invariants,
+   Terrain_Upload, Terrain_DepthMatch, Terrain_NoCracks, Ocean_Colour, Ocean_DepthRule.
+   (Note: Group B has 5 new tests: Terrain_RealData, Terrain_Quadtree, Cdlod_Cover, Cdlod_Invariants;
+   do not count an extra one; the total is 13 + 14 = 27 including Height_Sampler..Cam_PickFrustum (4),
+   Terrain_RealData, Terrain_Quadtree (2), Cdlod_Cover, Cdlod_Invariants (2), the three GPU terrain
+   tests (3), the two ocean tests (2) = 13 new. If your count differs, list the test names you
+   registered and reconcile before claiming completion.)
+4. `ron_view --hidden --frames 120 --vsync 0 --size 1280x720 --dump <build>/scene.ppm` exits 0 and
+   `python tools/check_scene_ppm.py <build>/scene.ppm` prints SCENE OK. Same with `--lod-debug --dump
+   <build>/lod.ppm`.
+5. Run the Gate 09 `tools/check_ppm.py` flow is no longer applicable to the new default scene; do not
+   run it on scene.ppm.
+6. Print: GL renderer string, ledger total MiB and per-category usage from ron_view, fps summary line,
+   average node count, Terrain_RealData log line, Cdlod perf median, final test counts. Do not claim
+   completion without pasting the actual outputs.
+
+IF SOMETHING FAILS: stop at the first failing group; do not continue to later groups. Report the group
+letter, the first failing test/assertion with file:line, and the last 30 lines of output. Never edit a
+test to make it pass.
+```
+
+---
+
+**What to send back**
+
+- If everything passes, reply **"Gate 11"**. That gate adds JFA SDF borders, crater splat and fog of war/radar.
+- Please also send me:
+  1. the `Terrain_RealData` log line (N, min/max, land fraction, biome dims);
+  2. the Cdlod perf median;
+  3. the `ron_view` fps line and ledger total.
+- Open the `scene.ppm` and `lod.ppm` if you can, or run `ron_view` without `--hidden` and fly around with WASD, Q/E and the mouse wheel. F2 toggles the LOD colours.
+- If something fails, paste only the group letter, the first failing assertion with file:line, and the last 30 lines of output.
+
+**Where I expect trouble**
+
+1. **Group B adapters (`terrain_source.cpp`).** I can't see your `TheatreData` and `TextureData` APIs, so the adapters are the one place Gemini has to read the real headers. If the biome section isn't a plain 8-bit array, the prompt tells it to stop and report.
+2. **Group B3 (biome→layer table).** Gemini has to match Gate 06 biome names to Gate 08 layer names. If the names don't line up, it will report the lists, and I'll fix the table.
+3. **Group C test 24 (`Terrain_NoCracks`).** The only allowed fix is a deeper skirt, and the test prints the pose and the failing pixels.
+4. **Group D tests.** They assume the ocean has some area at least 250 m from land, and that the highest peak is at least 25 m. Both should be true, and the tests stop and report if not.
+5. **Test count.** I flagged a count reconciliation in Final Verification step 3, because I counted 14 new render tests in the header numbering (14 to 27) but the prose lists 13 names. If Gemini's count disagrees with 27, the fix is to list the registered names. It is not a test failure.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-11-13T16:49:12+05:30.
+</ADDITIONAL_METADATA>

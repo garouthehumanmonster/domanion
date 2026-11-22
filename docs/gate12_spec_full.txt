@@ -1,0 +1,373 @@
+<USER_REQUEST>
+# GATE 12: AZDO entity renderer (instance SSBO, GPU culling, multi-draw-indirect)
+
+This is **Gate 12**. Gate 11 should have ended at T10+24 tests. I haven't seen your output, so the prompt starts with a precondition check. It stops if Gate 11 isn't green, and it records the real test count and counts from there.
+
+I don't know the exact vertex byte layout, VAT semantics, forward axis, winding or normal-map convention from Gates 07/08. The prompt makes Gemini write those answers down first in `docs/gate12_contract_notes.md`, then build to them, with tests that cross-check the decoding.
+
+Paste everything in the block below into a **NEW** Antigravity task.
+
+```
+GATE 12 of 30: AZDO ENTITY RENDERER (instance SSBO, GPU frustum+size culling, LOD buckets, multi-draw-indirect, VAT animation)
+Project: DOMINION 2026 (ron2026). Read GEMINI.md first. Everything below is already decided.
+Do not redesign. Do not "improve". Build exactly this.
+
+======================================================================
+§0 RULES (same as every gate)
+======================================================================
+R1. Work in the groups A..F below, in order. After EACH group: build Debug AND Release, run the group's
+    check command, and only then continue. Never batch groups.
+R2. NEVER weaken, delete, skip or loosen a test. If a number in this spec is provably impossible,
+    STOP, quote the exact line, fix code AND test with the smallest change, and log it in
+    docs/spec_deviations.md (date, group, quoted line, why impossible, what changed).
+R3. Only the TUNABLES listed in §1 may be adjusted to make a test pass. Nothing else.
+R4. Do NOT modify earlier gates' source except: CMake lists, docs, and the explicitly listed ADDITIVE edits
+    in this prompt. Additive = new functions/enum entries/members/defines; existing behaviour unchanged.
+R5. GL calls only in src/render and tests/render. DSA for create/modify. The only non-DSA calls allowed are
+    glBindImageTexture, glMemoryBarrier, glDispatchCompute, glMultiDrawElementsIndirect, glDrawElements* and state
+    calls (glEnable/glDepthFunc/glCullFace/glFrontFace/...). No glGetError outside tests.
+R6. No GPU allocation after the ledger freezes. Everything allocated in init() goes through VramLedger.
+    glNamedBufferSubData/glClearNamedBufferData/glTextureSubImage* are uploads/clears, NOT allocations: allowed at runtime.
+R7. No heap allocation per frame. Fixed arrays / persistent mapped ring only in per-frame paths.
+R8. ron_tests (GL-free sim tests) must stay EXACTLY as it was. All new tests go in ron_render_tests.
+R9. The sim NEVER reads any entity render structure. Gate 12 does NOT touch src/sim. (Sim -> render extraction comes with the
+    first gate that spawns real units. Gate 12 renders from a render-side EntityFeed only.)
+R10. Existing Gate 01..11 tests must keep passing in both builds.
+
+======================================================================
+§1 LOCKED DECISIONS
+======================================================================
+T11 = number of tests ron_render_tests reports BEFORE you change anything (expected T10+24).
+After group X the expected total is T11 + k. Final expected = T11 + 20.
+If the number you actually registered differs from k, list the registered names in your report; a count mismatch alone
+is not a failure, a failing test is.
+
+TUNABLES (the ONLY adjustable things):
+  LOD0_PX = 48   (allowed 48..96)    projected sphere radius in pixels at/above which LOD0 is used
+  LOD1_PX = 16   (allowed 16..32)    at/above which LOD1 is used (must stay < LOD0_PX)
+Everything else (CULL_PX=1.5, capacities, layouts, thresholds, formulas) is FIXED.
+
+Constants (src/render/entity_types.hpp):
+  MAX_INSTANCES=65536, MAX_MODELS=128, LODS_PER_MODEL=3, MAX_BUCKETS=MAX_MODELS*3 (=384), CULL_PX=1.5f,
+  VAT_FRAMES=44, VAT_COLS=48 (=16 parts x 3 texels), ANIM_FPS (see A0 note Q7; fallback 16.0),
+  clips: 0 Idle {start 0,count 8,loop 1}, 1 Move {8,16,1}, 2 Attack {24,8,1}, 3 Die {32,12,0},
+  FLAG_SELECTED = 1<<0, FLAG_HIT_FLASH = 1<<1 (flags occupy ids bits 20..27).
+
+EntityInstance (render-side, std430, 64 B, trivially copyable):
+  float pos_prev[3]; float yaw_prev;      // offset 0   (yaw radians, 0 = north (-Z), +pi/2 = east (+X))
+  float pos_curr[3]; float yaw_curr;      // offset 16
+  u32 ids;     // offset 32: model_id bits 0..15, owner bits 16..19, flags bits 20..27, bits 28..31 zero
+  u32 clip;    // offset 36: 0..3
+  float anim_t;// offset 40: seconds since clip start
+  float scale; // offset 44: uniform, > 0
+  float hp;    // offset 48: reserved (Gate 13), 0..1
+  u32 tint;    // offset 52: reserved, 0
+  u32 r0, r1;  // offset 56, 60: reserved, 0
+  helpers: u32 entity_pack_ids(model,owner,flags); model/owner/flags getters.
+ModelGpu (std430, 80 B): uvec4 lod[3] {index_count, first_index, base_vertex (int bits), 0}; vec4 sphere {cx,cy,cz,radius} (model space,
+  encloses LOD0 geometry in ALL 44 VAT poses, padded x1.02); uvec4 vat {row_base, 0,0,0}.
+DrawCmd = GL DrawElementsIndirectCommand {count, instanceCount, firstIndex, baseVertex, baseInstance} (20 B, tightly packed).
+EntityUbo (std140, 160 B): vec4 planes[6] (normalised, inside = dot(n,p)+d >= 0; order L,R,B,T,N,F; xyz=n, w=d);
+  vec4 cam_alpha {cam_pos xyz, alpha}; vec4 cull_p {proj_scale_px, LOD0_PX, LOD1_PX, CULL_PX};
+  uvec4 counts {instance_count, model_count, bucket_count (=model_count*3), 0}; vec4 time_p {time_s, ANIM_FPS, 0, 0}.
+  proj_scale_px = 0.5 * screen_height_px * proj[5]   (proj column-major, proj[5] = 1/tan(fovy/2)).
+Counters buffer (uint, 16 header + MAX_BUCKETS): [0] input, [1] visible, [2] frustum_culled, [3] size_culled, [4..6] visible per LOD,
+  [7] invalid_model (model id >= model_count; counted as culled), [8..15] 0, [16 + b] bucket counts.
+Rank buffer: uvec2 per instance {bucket or 0xFFFFFFFF, rank within bucket}. Visible buffer: uint per instance slot.
+Bucket b = model*3 + lod.
+
+Cull rule (reference = entity_cull_reference on CPU, mirrored by the shader):
+  alpha-interpolate: pos = mix(prev,curr,alpha); yaw = prev + wrap_pi(curr-prev)*alpha  (wrap_pi to [-pi,pi]).
+  centre_world = pos + R_y(yaw) * (sphere.xyz * scale)   (R_y per the A0 note Q4); radius_w = sphere.w * scale.
+  frustum: culled if any plane has dot(n,centre_world)+d < -radius_w.
+  size: dist = length(centre_world - cam_pos); px = radius_w * proj_scale_px / max(dist, 0.001);
+        px >= LOD0_PX -> lod 0; px >= LOD1_PX -> lod 1; px >= CULL_PX -> lod 2; else size-culled.
+  Order: invalid model -> frustum -> size.
+Plane extraction (column-major m[col*4+row], row r = (m[r], m[4+r], m[8+r], m[12+r])), reverse-Z + ZERO_TO_ONE
+  (inside iff -w<=x<=w, -w<=y<=w, 0<=z<=w):  L=row3+row0, R=row3-row0, B=row3+row1, T=row3-row1, N=row2, F=row3-row2; normalise by |xyz|.
+Animation sampling (shader and CPU reference identical):
+  f = anim_t*ANIM_FPS; loop: f = mod(f,count) else f = min(f, count-1); f0=floor(f); fr=f-f0;
+  f1 = loop ? (f0+1)%count : min(f0+1,count-1); rows = vat.row_base + start + f0 / f1; part matrix = lerp(m(f0), m(f1), fr) (3x4 rows).
+
+NEW BINDING DEFINES (add to the X-macro in src/render/gl_bindings.hpp; uniqueness holds within each category; Gate 09 uniqueness test must pass):
+  BIND_UBO_ENTITY=4, BIND_SSBO_MODELS=9, BIND_SSBO_BUCKETS=10 (the rank buffer),
+  TEX_VAT=14, TEX_TRIM_ALBEDO=15, TEX_TRIM_NORMAL=16, TEX_TRIM_ORM=17, TEX_TRIM_EMISSIVE=18.
+  (Existing: UBO 0..3, SSBO 0..8 [0 instances,1 visible,2 indirect,3 counters], TEX 0..13, IMG 0..4.)
+  Also inject RON_MAX_BUCKETS, RON_VAT_FRAMES, RON_ANIM_FPS, RON_CULL_PX, RON_ENTITY_ALBEDO_DECODE as defines (existing define-injection mechanism).
+NEW ProgramIds: EntityCullCount, EntityCullScan, EntityCullScatter, EntityDraw, EntityDrawOvl.
+  EntityDrawOvl compiles the same entity shaders with RON_OVERLAYS=1 (it includes world_overlay.glsl and applies ovl_fog only).
+
+VRAM (ledger categories): trim textures -> TrimTextures; vertex/index/model table -> ModelGeometry; VAT -> VatTextures;
+  instance ring (3 x 65536 x 64 B), visible, rank, indirect, counters, EntityUbo -> EntityBuffers.
+  Budgets: ModelGeometry <= 128 MiB, TrimTextures <= 64, VatTextures <= 32, EntityBuffers <= 40. Total stays <= 2304 MiB.
+
+ADAPTER RULE: only src/render/entity_source.cpp may include model_data.hpp / texture_data.hpp for the entity path
+  (terrain_source.cpp remains the terrain adapter). Everything else in the entity path sees only the render-side structs.
+
+GEMINI.md addition (append, one paragraph; ALSO edit the Gate 10 adapter sentence to say "Only terrain_source.cpp and entity_source.cpp may include theatre_data.hpp/texture_data.hpp/model_data.hpp from src/render"):
+"Entities: render-side EntityInstance (64 B) -> compute cull (frustum + projected-size, LOD by pixel radius, bucket = model*3+lod) ->
+prefix scan builds DrawElementsIndirect commands -> scatter writes the visible list -> ONE glMultiDrawElementsIndirect.
+Vertex shader reads visible[gl_BaseInstance+gl_InstanceID]; VAT frames give per-part 3x4 matrices. Interpolation prev->curr uses alpha in EntityUbo.
+Entities are drawn after terrain and BEFORE the ocean. The sim never reads entity render data. Contracts are in docs/render_contracts.md and docs/gate12_contract_notes.md."
+
+======================================================================
+§2 PRECONDITIONS (before any code)
+======================================================================
+P1. Build Debug and Release (the two build dirs in GEMINI.md). Run ron_tests and ron_render_tests (both builds) and the Gate 08 python selftest
+    (must print ALL GROUPS PASS (35/35)). Confirm these files exist: assets/compiled/models/models_2026.mdbin,
+    assets/compiled/textures/textures_2026.tex26, assets/compiled/theatres/continent_2026.thtr. If a bake output is missing, run the baker commands
+    listed in GEMINI.md/docs, then continue.
+P2. Write docs/gate12_baseline.txt with three lines:  T_SIM=<ron_tests count>  T11=<ron_render_tests count>  PY08=35
+P3. If anything fails: STOP and report the first failing test with file:line plus the last 30 lines. Write no code.
+P4. Read (do not edit): src/assets/model_data.hpp, src/assets/texture_data.hpp, docs/asset_contracts.md, assets/source/trims.json,
+    tools/model_baker (the vertex pack function and VAT writer, only if the contract text is ambiguous), src/render/gl_bindings.hpp,
+    the shader program registry, gpu_buffer/gpu_texture headers, the PersistentRing and GpuTimer headers, frame_fill, terrain_renderer.*,
+    scene_fixture.*, terrain_source.cpp (how it uploads tex26 textures), world_overlays.hpp, and the Gate 10 terrain fragment shader
+    (how it uses sun_dir/sun_color and computes distance fog). Reuse those helpers. Do not invent parallel ones.
+P5. Confirm GL limits at runtime in a throwaway check or in test Ent_Layout: GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS >= 11.
+
+======================================================================
+GROUP A: contract notes, types, CPU math, model adapter  -> k=6, total T11+6
+======================================================================
+A0. BEFORE CODING write docs/gate12_contract_notes.md answering, with the source line/file that proves each answer:
+  Q1 exact byte layout of the 24-byte vertex (offset, format, meaning of every field: position, normal, uv, part index, anything else).
+  Q2 what a VAT texel row stores: ABSOLUTE part transform or DELTA from the rest pose; texel order (col = part*3 + k, k = matrix row 0..2?),
+     whether frame-0 Idle equals identity; what unused parts (>= part count) contain.
+  Q3 index/vertex organisation per LOD: does each LOD own its vertex run, or share the model's vertices? (determines base_vertex per LOD)
+  Q4 model-local forward axis, and therefore the yaw rotation so that yaw 0 points the model's forward at north (-Z) and +pi/2 at east (+X).
+     Heading vector = (sin yaw, 0, -cos yaw). Write R_y explicitly as a 3x3.
+  Q5 triangle winding (CCW or CW when viewed from outside) for front faces.
+  Q6 normal-map convention (is the green channel +v or -v direction; "v down the image" means texture row 0 = image top) and the exact
+     bitangent sign to use with the derivative-based tangent frame (B = dP/dv or its negative).
+  Q7 VAT animation frame rate if specified anywhere; else write "ANIM_FPS=16 (fallback)".
+  Q8 sRGB flag status for tex26 ids 0..3 (trim_albedo/normal/orm/emissive): decides BC1_SRGB vs BC1 + shader decode (RON_ENTITY_ALBEDO_DECODE=0/1).
+  Also list the ModelData API you will use: model count, per-model name/category (infantry/vehicle/air/naval/building/prop/resource/projectile),
+  vertex/index spans per LOD, VAT data access.
+  If an answer is genuinely not derivable from the repo, choose the simplest consistent option and mark it "DECISION" in the note.
+
+Files:
+ src/render/entity_types.hpp   constants/structs above, entity_pack_ids and getters, static_asserts (sizeof/offsetof of EntityInstance 64,
+   ModelGpu 80, EntityUbo 160, DrawCmd 20; is_trivially_copyable; constants).
+ src/render/entity_feed.hpp/.cpp   class EntityFeed { static storage MAX_INSTANCES; void clear(); bool add(const EntityInstance&); // false + ++dropped if full
+   int count() const; u32 dropped() const; const EntityInstance* data() const; }  (storage allocated once at construction/init, never per frame)
+ src/render/entity_math.hpp/.cpp   (GL-free; this is the REFERENCE for the shaders)
+   float wrap_pi(float); float lerp_yaw(float prev,float curr,float alpha);
+   void entity_model_matrix(const float pos[3], float yaw, float scale, float out_col_major[16]);  // T * R_y(Q4) * S
+   void entity_planes_from_viewproj(const float vp[16], float planes[6][4]);
+   void entity_fill_ubo(const FrameUniforms&, float alpha, u32 instance_count, u32 model_count, float time_s, EntityUbo*);
+   struct ModelCpu { name/category, u32 lod_index_count[3], lod_first_index[3]; i32 lod_base_vertex[3]; float sphere[4]; u32 vat_row_base; ... };
+   struct CullResult { u32 bucket /*0xFFFFFFFF if culled*/; u8 reason /*0 visible,1 invalid,2 frustum,3 size*/; bool ambiguous; };
+   CullResult entity_cull_reference(const EntityInstance&, const ModelCpu* models, const EntityUbo&);
+     ambiguous = any plane value (dot+d+radius_w) within +-0.05 of 0, OR |px-T|/T < 0.002 for T in {LOD0_PX, LOD1_PX, CULL_PX}.
+   int entity_lod_from_px(float px);  // -1 = size-culled
+   void vat_part_matrix(const VatCpu&, int model, int clip, float anim_t, int part, float out3x4[12]);   // exact sampling rule from §1
+   void skin_position(const float m3x4[12], const float p[3], float out[3]);
+   (VatCpu = a plain view of the VAT texels as u16 halves or floats; provide half->float conversion.)
+ src/render/entity_vertex_layout.hpp   constants for the Q1 layout (offsets, strides) + static_assert(stride==24); and a CPU decode function
+   struct DecodedVertex{float pos[3]; float nrm[3]; float uv[2]; u32 part;}; DecodedVertex decode_vertex(const u8*).
+ src/render/entity_source.cpp/.hpp   THE ONLY adapter. Produces from ModelData/TextureData: contiguous vertex blob (u8), contiguous index blob (u16),
+   std::vector<ModelCpu> (built at init time only), the ModelGpu table (computed sphere: transform all LOD0 vertices by vat_part_matrix for every
+   one of the 44 frames, take a bounding sphere (centre = bbox centre, radius = max distance), pad x1.02), the VAT texel blob, the 4 trim texture
+   views (format code, size, mips, flags, per-level data pointers), and bool entity_front_face_ccw() (the one place the winding constant lives, per Q5).
+   Fail with a clear message (not a crash) if an asset is missing.
+ Tests (tests/render/test_entity_cpu.cpp; register all in ron_render_tests):
+  1 Ent_Layout: all static_asserts mirrored as runtime checks (sizes/offsets), the new binding defines exist with §1 values, entity_pack_ids round trip
+    for 1000 deterministic triples, bucket math (b=model*3+lod, model=b/3, lod=b%3) for all b < MAX_BUCKETS, GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS >= 11.
+  2 Ent_Feed: add up to MAX_INSTANCES succeeds, the next add returns false and dropped()==1, 5 more -> dropped()==6; clear() resets count (not dropped
+    unless a reset_dropped exists); contents round trip byte-exact for 100 random instances.
+  3 Ent_Interp: lerp_yaw(350deg,10deg,0.5)==0 (+-1e-5 rad mod 2pi), lerp_yaw(10deg,350deg,0.5)==0, alpha 0 -> prev, alpha 1 -> curr (angles compared mod 2pi);
+    entity_model_matrix: transforming the Q4 model-local forward axis gives the heading vector (sin yaw,0,-cos yaw) within 1e-5 for 16 yaws; scale and
+    translation applied; matrix is orthogonal up to scale.
+  4 Ent_Planes: for the Gate 10 fixture camera (focus = first land site or the fixture default, dist 120, yaw 0.4): planes are unit length; for 20000
+    deterministic random points in a box around the camera, plane-inside agrees with the clip-space test (-w<=x<=w, -w<=y<=w, 0<=z<=w) except for points
+    whose min plane distance is within 1e-3 (those are skipped; at most 1% may be skipped). Also: the focus point is inside; a point 100 m behind the eye is outside;
+    a point beyond the far plane is outside.
+  5 Ent_ModelTable: model_count == ModelData count (71 now, must be <= MAX_MODELS). For EVERY model: lod index counts non-increasing (lod0>=lod1>=lod2>0) and
+    divisible by 3; first_index+count within the index blob; max index of each LOD < the vertex count available from its base_vertex; radius > 0; decode_vertex on
+    EVERY LOD0 vertex gives |normal| in 1+-0.03, uv in [-0.01,1.01], part < 16, finite position; every skinned LOD0 vertex in every one of the 44 frames lies
+    within sphere.radius (+1e-3) of the sphere centre; vat.row_base == model_index*44; and the winding check: signed volume (sum dot(v0,cross(v1,v2))/6 over
+    LOD0 triangles, vertices skinned with frame 0 Idle) has the sign implied by entity_front_face_ccw() (positive for CCW) for >= 90% of models that are not
+    category prop/resource/projectile. Print totals: vertex bytes, index bytes, VAT bytes.
+  6 Ent_LodSelect: entity_lod_from_px: exactly LOD0_PX -> 0, just under -> 1; exactly LOD1_PX -> 1, just under -> 2; exactly CULL_PX -> 2, just under -> -1;
+    monotone non-increasing LOD detail with distance for 1000 sample distances using a fixed radius (use the constants, never literals, for thresholds);
+    entity_cull_reference on 3 hand-built instances (one in front near -> lod 0, one behind the camera -> frustum, one far tiny -> size) matches.
+CHECK A: build both; ron_render_tests (both builds) -> T11+6 pass; ron_tests count unchanged.
+
+======================================================================
+GROUP B: GPU assets (geometry, VAT, trims)  -> k=3, total T11+9
+======================================================================
+ src/render/entity_assets.hpp/.cpp   class EntityAssets
+   bool init(VramLedger&);   // calls entity_source; creates VBO, IBO, ModelGpu SSBO (ModelGeometry); VAT texture RGBA16F 48 x (44*model_count),
+                             // NEAREST, clamp (VatTextures); 4 trim textures (TrimTextures): formats per the Q8 note, full mip chain, LINEAR_MIPMAP_LINEAR,
+                             // CLAMP_TO_EDGE, GL_TEXTURE_MAX_LOD = 5 (trim LOD clamp), max anisotropy 8 (clamped to the device limit).
+                             // A VAO (DSA) from entity_vertex_layout.hpp: attributes pos(vec3) normal(vec3, normalised) uv(vec2) part(uint, glVertexArrayAttribIFormat);
+                             // the shader input locations are fixed: 0 pos, 1 normal, 2 uv, 3 part. The IBO is attached to the VAO (u16).
+   int model_count() const; const ModelCpu& model(int) const; const ModelCpu* models() const; GLuint vao(), vbo(), ibo(), model_ssbo(), vat_tex();
+   GLuint trim_tex(int which /*0 albedo,1 normal,2 orm,3 emissive*/); bool albedo_needs_decode() const; bool front_face_ccw() const;
+   u64 vram_bytes() const; void shutdown();
+ Use the Gate 10/09 GpuBuffer/GpuTexture helpers and the existing tex26 upload path pattern; do not duplicate parallel texture code if a helper already exists.
+ Tests (tests/render/test_entity_assets.cpp), each with its own local (unfrozen) VramLedger:
+  7 Ent_AssetsUpload: init succeeds on the real assets. Read back (glGetNamedBufferSubData) the whole ModelGpu SSBO and compare byte-exact with the CPU table;
+    the first 4096 bytes and last 4096 bytes of VBO and IBO equal the CPU blobs; 200 deterministic VAT texels (glGetTextureSubImage GL_RGBA/GL_HALF_FLOAT,
+    compare the raw u16) equal the source; VAO attribute 0..3 enabled (glGetVertexArrayIndexediv).
+  8 Ent_TrimTextures: for each of the 4 trim textures: level 0 first 64 blocks (glGetCompressedTextureSubImage) equal the tex26 bytes; level 5 first 16 blocks
+    equal; GL_TEXTURE_MAX_LOD == 5.0; GL_TEXTURE_IMMUTABLE_FORMAT true; the internal format matches the Q8 decision.
+  9 Ent_VramAssets: ledger delta equals the sum of the vram_bytes() of the new objects EXACTLY; ModelGeometry <= 128 MiB, TrimTextures <= 64 MiB,
+    VatTextures <= 32 MiB; print the three numbers.
+CHECK B: build both; ron_render_tests -> T11+9 pass.
+
+======================================================================
+GROUP C: GPU culling pipeline (compute)  -> k=4, total T11+13
+======================================================================
+Shaders (all compute, #version 460 core first line, shared include shaders/entity_common.glsl which holds: Inst struct (std430 64 B), ModelGpu struct,
+EntityUbo block, wrap_pi/lerp_yaw/model_matrix helpers, vat sampling helpers; every formula literally identical to entity_math.cpp):
+ entity_cull_count.comp (local_size 64): i<instance_count else return. Shared-memory per-workgroup counters flushed with one atomicAdd each to
+   COUNTERS[0..7]. Compute reason/lod exactly as the Cull rule. If visible: rank = atomicAdd(COUNTERS[16+bucket],1); ranks[i]=uvec2(bucket,rank).
+   else ranks[i]=uvec2(0xFFFFFFFFu,0).
+ entity_cull_scan.comp (local_size 256, ONE workgroup): thread t handles buckets 2t and 2t+1 (bucket_count <= 384 < 512):
+   c0,c1 = counts or 0 beyond bucket_count; shared s[256]=c0+c1; Hillis-Steele inclusive scan (read all, barrier, add, barrier per step);
+   excl = s[t]-(c0+c1); for each bucket b of the thread (cmd for b1 uses base = excl + c0): model=b/3, lod=b%3;
+   INDIRECT[b] = {count=models[model].lod[lod].x, instanceCount=c, firstIndex=.y, baseVertex=int(.z), baseInstance=base}. Only buckets < bucket_count are written.
+ entity_cull_scatter.comp (local_size 64): i<instance_count; (b,r)=ranks[i]; if b==0xFFFFFFFF return; visible[INDIRECT[b].baseInstance + r] = i.
+ The INDIRECT buffer is bound as SSBO BIND_SSBO_INDIRECT (std430 uint array, 5 uints per command) for the scan/scatter passes and as GL_DRAW_INDIRECT_BUFFER for drawing.
+ src/render/entity_renderer.hpp/.cpp (cull part now; draw in group D)   class EntityRenderer
+   bool init(VramLedger&, EntityAssets&);   // instance ring: 3 slots x MAX_INSTANCES x 64 B via the Gate 09 PersistentRing (read its API); visible (4 B x MAX_INSTANCES),
+                                            // ranks (8 B x MAX_INSTANCES), indirect (20 B x MAX_BUCKETS), counters ((16+MAX_BUCKETS)*4 B), EntityUbo (160 B).
+   EntityFeed& feed();   void begin_frame(int frame_index);   // advances/fences the ring slot, clears the feed
+   void upload();        // memcpy feed -> ring slot (one memcpy), remember count
+   void cull(const FrameUniforms&, float alpha, float time_s, bool freeze=false);
+        // fills EntityUbo (entity_fill_ubo) with glNamedBufferSubData; if freeze: do nothing else;
+        // else: glClearNamedBufferData(counters, R32UI zero), bind SSBOs (instances = ring slot range), dispatch count, barrier(SHADER_STORAGE),
+        // scan (1 group), barrier, scatter, then barrier(COMMAND | SHADER_STORAGE | UNIFORM).
+   struct EntityStats {u32 input,visible,frustum_culled,size_culled,lod[3],invalid; int draws;};
+   EntityStats read_stats_blocking();   // glGetNamedBufferSubData, tests/exit only
+   GLuint indirect_buffer(), visible_buffer(), counters_buffer(), rank_buffer(); int draw_count() const /* model_count*3 */; u64 vram_bytes() const; void shutdown();
+ Test helpers (tests/render/entity_test_util.hpp): deterministic xorshift generator local to the tests; make_random_instances(); read helpers for the buffers.
+ Tests (tests/render/test_entity_cull.cpp), own local ledger, Gate 10 fixture, camera focus = first land site, yaw 0, 640x360 hidden window:
+  10 Cull_MatchesCpu: camera dist 120. N=20000: 1000 "near" instances within +-60 m of the focus (scale 2..4, random models) + 19000 spread in +-900 m
+     (scale 0.5..2.5, any model; y = terrain height + 0..30; yaw random; curr = prev + up to 2 m; alpha 0.5). cull; read ranks, counters, indirect, visible.
+     CPU reference gives bucket/reason/ambiguous per instance. For all NON-ambiguous instances: GPU bucket == CPU bucket (compare via the ranks buffer). Ambiguous
+     instances must be <= 0.2% of N. Coverage asserts: counters lod[0],lod[1],lod[2] each >= 20; frustum_culled >= 200; size_culled >= 200; counters[1]==visible sum;
+     counters[0]==N; counters[1]+[2]+[3]+[7]==N.
+  11 Cull_Cmds: using the data of test 10: for every bucket b: command {count,firstIndex,baseVertex} equal the ModelGpu table entry; baseInstance equals the exclusive
+     prefix sum of instanceCount over buckets (computed independently in the test); sum(instanceCount)==counters[1]; every visible[baseInstance..+instanceCount) entry is < N,
+     belongs to bucket b per the GPU rank buffer, and no instance id appears twice in the whole visible list (bitset of N).
+  12 Cull_Edge: (a) N=0 -> all commands instanceCount 0, all counters 0 (dispatch of 0 groups is legal). (b) N=65536 copies of model 0 at the focus, yaw 0, scale 1, alpha 0
+     -> exactly one bucket has instanceCount 65536, visible[0..65535] is a permutation of 0..65535. (c) 5000 instances 50 m behind the eye -> visible 0, frustum_culled 5000.
+     (d) one instance with model id = model_count (invalid) -> counters[7]==1, visible 0.
+  13 Cull_Perf: N=32768 instances spread +-600 m around the focus (camera dist 300). GpuTimer around [clear + count + scan + scatter]: 2 warm-up runs then 7 timed,
+     median < 0.6 ms. If it fails report all 7 numbers; do NOT change the threshold. Only tunables LOD0_PX/LOD1_PX may move.
+CHECK C: build both; ron_render_tests -> T11+13 pass.
+
+======================================================================
+GROUP D: draw path (shaders, TerrainRenderer split, overlays)  -> k=5, total T11+18
+======================================================================
+ ADDITIVE edit to TerrainRenderer: add draw_terrain(...) and draw_ocean(...) (same parameters the existing draw uses, split at the point where the ocean begins).
+   The existing draw(...) must call them in that order and behave byte-for-byte as before. Find the real names/signatures in terrain_renderer.hpp and adapt.
+ shaders/entity_draw.vert / entity_draw.frag (both include entity_common.glsl; with RON_OVERLAYS the frag also includes world_overlay.glsl):
+  vert: inst = instances[visible[gl_BaseInstance + gl_InstanceID]]; model = ids & 0xFFFF; clip sampling per §1 (two frames, fetch 3 texels per frame with
+        texelFetch(u_vat, ivec2(part*3+k, row), 0)); apply the part matrix per the Q2 semantics; then entity_model_matrix(interpolated pos/yaw, scale);
+        normal = R_y * (part 3x3 * a_normal), renormalised. Output: world_pos, world_normal, uv, owner (flat), flags (flat). gl_Position = frame.view_proj * vec4(world,1).
+  frag: trim albedo (decode to linear per RON_ENTITY_ALBEDO_DECODE with the EXACT sRGB->linear formula), normal via derivative tangent frame
+        (cotangent_frame from dFdx/dFdy of world_pos and uv; bitangent sign per Q6; normal xy = rg*2-1, z = sqrt(max(0,1-dot(xy,xy)))), ORM (R=AO, G=rough, B=metal),
+        emissive (R of BC4). Placeholder lighting (Gate 13 replaces it): Lambert with sun_dir/sun_color used EXACTLY the way the terrain fragment shader uses them
+        (same sign convention), hemisphere ambient 0.18..0.32 scaled by AO, diffuse *= (1-metal), Blinn-Phong spec with power = mix(8,128,1-rough) and
+        F0 = mix(0.04, albedo, metal), emissive adds albedo*e*2.0. Team colour: albedo = mix(albedo, owner_colour_luma_preserved, 0.30) using the Gate 11
+        palette (overlay_palette) via a small constant array in the shader generated/injected from C++ (do NOT hard-code a second palette: inject from
+        overlay_palette() as defines or a UBO-free const array built by the preprocessor). FLAG_HIT_FLASH: color = mix(color, vec3(1.0), 0.5).
+        Then apply the SAME distance fog as the Gate 10 terrain shader (copy the formula into entity_common.glsl with the comment "must stay identical to
+        terrain; unify in Gate 13"). With RON_OVERLAYS: color = ovl_fog(color, world_xz) at the very end (no territory, no craters on units).
+        Output location 0, linear HDR, alpha 1.
+  State in EntityRenderer::draw(): depth test GL_GREATER, depth write ON, cull face BACK, front face per EntityAssets::front_face_ccw(), blending off. Bind VAO, DRAW_INDIRECT
+        buffer, textures 14..18 (glBindTextureUnit), instance ring range, visible SSBO, model SSBO, frame UBO already bound by the caller; then ONE
+        glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT, 0, draw_count, 20). Restore cull/depth state that the terrain/ocean code expects (read how it sets state).
+   void EntityRenderer::set_overlays(WorldOverlays*): when non-null uses EntityDrawOvl and calls ovl->bind_world_pass() before drawing.
+ Frame order (document in docs/render_contracts.md and implement in the test fixture helper): update overlays -> entities begin_frame/upload/cull -> bind HDR target + clear ->
+   draw_terrain -> entities draw -> draw_ocean -> tonemap -> (minimap/UI).
+ tests/render/entity_fixture.hpp: a helper (do NOT edit the Gate 10 helper) that renders the fixture scene with that frame order, returning colour pixels and depth readback.
+ Tests (tests/render/test_entity_draw.cpp), 640x360 hidden window, flags/overlays off unless stated, fixture focus = first land site:
+  14 Entity_Draw_Visible: for EVERY model m in 0..model_count-1 (loop): scale = 8/sphere.radius, alpha 0, one instance at (focus.x, terrain height, focus.z), yaw 0, clip Idle t=0, owner 1;
+     camera dist 60 yaw 0. Render terrain-only reference once, then terrain+entity. Compute the projected circle of the bounding sphere (project the world centre and a point
+     offset by radius_w along the camera right vector; use the real frame matrices). CHANGED pixel = any channel differs by > 2 levels.
+     Require: changed count INSIDE the circle (radius*1.0) >= 40 px; changed count OUTSIDE the circle of radius (r_px*1.10 + 3 px) == 0.
+     Log the model index/name on failure. Print once how many models rendered at LOD0 (info only).
+  15 Entity_Anim: (a) loop continuity: for 2 infantry models and 1 vehicle: clip Move at anim_t = 0 vs anim_t = 3*16/ANIM_FPS (three whole cycles): images equal within 2 levels
+     everywhere. (b) Die clamp: clip Die at anim_t = 100 s vs 200 s: equal within 1 level. (c) Animation changes pixels: among the infantry models (category from the adapter),
+     at least ONE has >= 30 pixels differing by > 8 levels between Move at t=0 and Move at t=0.5*16/ANIM_FPS; log how many of the infantry animate.
+  16 Entity_Interp_Render: one model (first vehicle) at A=(focus.x-6, h, focus.z), B=(focus.x+6, h', focus.z+3). Render with prev=A, curr=B, alpha=0.5 and compare with prev=curr=midpoint(A,B) alpha 0:
+     mean abs diff <= 0.1 per channel and max <= 8 over the image. Yaw wrap case: prev yaw 350 deg, curr 10 deg, alpha 0.5 equals yaw 0 under the same comparison.
+     alpha 0 equals prev-only and alpha 1 equals curr-only (same comparison).
+  17 Entity_Water_Order: choose an open-sea point (>= 250 m of sea around it, as Gate 10's ocean tests do; reuse their finder) and camera dist 60 looking at it; a vehicle model
+     scaled to 8 m radius at y=+12 m above the sea. Render with the real frame order (entities before ocean). Render the same instance with the ocean draw skipped.
+     At the pixels where the entity covers the screen (changed vs a no-entity render with the ocean skipped), the full-frame render equals the no-ocean render within 1 level
+     (entity above water is never covered by ocean). Also at least 40 such pixels exist.
+  18 Entity_Fog: WorldOverlays::init, set_overlays on the entity renderer, flags: fog ON with a FogMap that is totally unexplored (reset, commit) and update(100.0f). Entities rendered at the
+     focus: the 16x16 block at the projected sphere centre has mean luminance <= 6 (0..255). Then FogMap.reveal_all()+commit, update(100.0f): the same block luminance equals the
+     overlays-OFF render within 2 levels.
+CHECK D: build both; ron_render_tests -> T11+18 pass. Also run an existing Gate 10 and Gate 11 render test subset again (they are part of the total) to prove the split TerrainRenderer is unchanged.
+
+======================================================================
+GROUP E: ron_view integration, crowd demo, performance, VRAM  -> k=2, total T11+20
+======================================================================
+ ron_view additions (additive; with --crowd 0 the Gate 10/11 behaviour is untouched):
+   CLI: --crowd N (default 3000, max 60000; 0 disables entities). Deterministic crowd (PRNG seed 2026), arrays allocated ONCE at startup:
+        spawn around the focus within a 500 m radius on land (height >= 2 m, rejection sampling, max 50 tries then skip); mix: infantry 50%, vehicle 35%, air 10% (y = ground+60 m),
+        building 5% (static, speed 0). speeds: infantry 3..5 m/s, vehicle 6..10 m/s, air 25..40 m/s. owner = 1 + i%8. clip Move for movers, Idle for buildings.
+        Fixed 20 Hz tick: accumulate dt; each tick prev=curr, curr += heading*speed*0.05 (heading (sin yaw,0,-cos yaw)), y = terrain height (air: +60), anim_t += 0.05;
+        if the next position is over water (height < 0.5) for ground units, or farther than 600 m from the start focus, turn yaw by +pi*(0.75..1.25) (deterministic). Yaw turns are instant
+        (prev yaw = curr yaw at the tick of a turn). alpha = accumulator/0.05.
+        entities hit-flash: every 256th crowd member has FLAG_HIT_FLASH.
+   Keys: F6 print entity stats once (blocking read, allowed), F7 toggle "freeze cull" (debug: cull() with freeze=true, draws the stale visible list).
+   Frame order exactly as Group D. The entity feed is rebuilt every frame from the crowd arrays (interpolation done in the shader, the feed carries prev/curr).
+   At exit print: "entities: input=%u visible=%u frustum_culled=%u size_culled=%u lod0=%u lod1=%u lod2=%u draws=%d dropped=%u" plus the existing fps and overlays lines.
+   --dump still writes scene.ppm and minimap.ppm.
+ Tests (tests/render/test_entity_perf.cpp):
+  19 Entity_FramePerf: own ledger + EntityAssets + EntityRenderer on the fixture; 20000 instances (the same generator as the crowd: positions around the focus, dist 300, 640x360).
+     Full frame with the real frame order; GpuTimer around [cull + entity draw] only. 2 warm-up frames then 7 timed, median < 4.0 ms. Also glGetError()==0 after the frames,
+     and the stats readback satisfies visible > 0 and input == 20000. If it fails report the 7 numbers; only tunables LOD0_PX/LOD1_PX may move (raising either lowers cost).
+  20 Vram_Gate12: a fresh ledger as ron_view uses it: init terrain (Gate 10) + overlays (Gate 11) + minimap + EntityAssets + EntityRenderer in the SAME order ron_view does; the ledger delta
+     of the Gate 12 objects equals the sum of vram_bytes() EXACTLY (EntityAssets + EntityRenderer); EntityBuffers delta <= 40 MiB; freeze succeeds; total <= 2304 MiB.
+     Print the ledger dump lines for the new categories and the total.
+CHECK E: build both; ron_render_tests -> T11+20 pass. ./ron_view --hidden --frames 120 --crowd 20000 --dump exits 0 and prints the entities line.
+
+======================================================================
+GROUP F: final verification
+======================================================================
+ F1. Debug AND Release: 0 errors, 0 warnings (project warning flags on, third-party excluded as before).
+ F2. ron_tests: count equals T_SIM from docs/gate12_baseline.txt, all pass.
+ F3. ron_render_tests: T11+20 pass in both builds. Python Gate 08 selftest still ALL GROUPS PASS (35/35).
+ F4. ./ron_view --hidden --frames 120 --crowd 20000 --fog --dump -> exits 0; tools/check_scene_ppm.py scene.ppm and minimap.ppm both OK.
+     Also ./ron_view --hidden --frames 5 --crowd 0 exits 0 and prints no entities line. Report the fps line, the entities line and the ledger total.
+ F5. Update docs/render_contracts.md with sections: "Entities" (instance/ModelGpu/EntityUbo/counters/rank layouts, bucket formula, cull rule, plane extraction,
+     LOD constants, animation sampling), "Entity frame order", "Entity assets" (vertex layout, VAT semantics, winding, normal-map convention, trim LOD clamp 5, sRGB decision).
+     Append the GEMINI.md paragraph from §1 and fix the adapter sentence as instructed.
+ F6. docs/spec_deviations.md updated if anything was logged (else leave it).
+
+======================================================================
+WHAT TO SEND BACK
+======================================================================
+ - "ron_render_tests: <N>/<N> in Debug and Release" plus the contents of docs/gate12_baseline.txt.
+ - docs/gate12_contract_notes.md (just the Q1..Q8 answers, short), and anything marked DECISION.
+ - The Cull_Perf 7 timings, the Entity_FramePerf 7 timings, the number of infantry that animate (Entity_Anim log), the number of models at LOD0 (Entity_Draw_Visible log).
+ - The ron_view fps line, the entities line, the new ledger total.
+ - Anything logged in docs/spec_deviations.md.
+ IF SOMETHING FAILS: send ONLY the group letter, the first failing test/assertion with file:line, and the last 30 lines of output.
+```
+
+When it's done, reply **"Gate 13"** (shadows, PBR-lite, NATO icons, world bars).
+
+To check by eye after Group E, run `ron_view --crowd 20000` unhidden:
+- **Facing:** units should walk forward. If they walk sideways or backwards, the forward axis from note Q4 is wrong. Send me that line of the notes plus which way they face.
+- **Culling:** press `F7` to freeze the cull, then fly around. Models outside the frozen view should stop appearing, and no instances should flicker.
+- **Winding:** if models look hollow or inside-out, tell me. That means the winding constant in `entity_source.cpp` is wrong.
+- **Detail:** at the maximum zoom-out, infantry vanish by design, because they are below 1.5 px. Gate 13's NATO icons replace them.
+
+**Risk points** (in case Gemini stalls):
+- **A0 contract notes:** if Gemini hand-waves the vertex layout or VAT semantics, `Ent_ModelTable` should catch it, because the normals, UVs and posed bounding sphere won't validate.
+- **`Ent_AssetsUpload` and `Ent_TrimTextures`:** they depend on the real `ModelData`/`TextureData` APIs. Per P4 and R4, Gemini adapts only the adapter file, not the earlier gates.
+- **`Entity_Draw_Visible`:** it tests all 71 models with an "outside the bounding circle is unchanged" check. A failure on one model usually means the sphere or the VAT pose is wrong for that model, not a culling bug.
+- **`Cull_Perf` and `Entity_FramePerf`:** the thresholds are 0.6 ms and 4.0 ms. If they miss, send me the seven timings. The only allowed lever is raising `LOD0_PX`/`LOD1_PX`.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-11-13T19:01:22+05:30.
+</ADDITIONAL_METADATA>

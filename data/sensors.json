@@ -1,0 +1,72 @@
+[
+  {
+    "id": "optical_basic",
+    "name": "Basic Optical Sensor",
+    "band": "Optical",
+    "flags": 0,
+    "scan_period_ticks": 10,
+    "range": 45.0,
+    "power": 1000,
+    "detect_threshold": 100
+  },
+  {
+    "id": "optical_long",
+    "name": "Long-Range Optical Sensor",
+    "band": "Optical",
+    "flags": 0,
+    "scan_period_ticks": 10,
+    "range": 70.0,
+    "power": 1600,
+    "detect_threshold": 100
+  },
+  {
+    "id": "radar_air_search",
+    "name": "Air Search Radar",
+    "band": "Radar",
+    "flags": 1,
+    "scan_period_ticks": 20,
+    "range": 300.0,
+    "power": 40000,
+    "detect_threshold": 100
+  },
+  {
+    "id": "broadband_radar_9",
+    "name": "Broadband Radar Gen 9",
+    "band": "Radar",
+    "flags": 1,
+    "scan_period_ticks": 20,
+    "range": 350.0,
+    "power": 400000,
+    "detect_threshold": 100
+  },
+  {
+    "id": "sonar_hull",
+    "name": "Hull Sonar",
+    "band": "Sonar",
+    "flags": 1,
+    "scan_period_ticks": 20,
+    "range": 120.0,
+    "power": 20000,
+    "detect_threshold": 100
+  },
+  {
+    "id": "counter_battery_radar",
+    "name": "Counter-Battery Radar",
+    "band": "CounterBattery",
+    "flags": 1,
+    "scan_period_ticks": 20,
+    "range": 700.0,
+    "power": 30000,
+    "detect_threshold": 100
+  },
+  {
+    "id": "ew_jam_dome",
+    "name": "EW Jamming Dome",
+    "band": "EW_Jamming",
+    "flags": 1,
+    "scan_period_ticks": 20,
+    "range": 140.0,
+    "power": 10000,
+    "detect_threshold": 100
+  }
+]

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "sim/theatre_data.hpp"
+#include "assets/theatre_data.hpp"
 #include "assets/texture_data.hpp"
 #include "render/terrain_source.hpp"
 #include "render/height_sampler.hpp"
@@ -13,7 +13,7 @@
 
 namespace ron::render::test {
 
-const sim::TheatreData& test_theatre();
+const assets::TheatreData& test_theatre();
 const assets::TextureData& test_tex26();
 const TerrainSource& test_source();
 const HeightSampler& test_sampler();

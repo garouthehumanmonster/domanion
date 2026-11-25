@@ -22,7 +22,7 @@
 #include "render/entity_assets.hpp"
 #include "render/entity_renderer.hpp"
 #include "render/entity_crowd.hpp"
-#include "sim/theatre_data.hpp"
+#include "assets/theatre_data.hpp"
 #include "assets/texture_data.hpp"
 #include "core/arena.hpp"
 #include "core/assert_log.hpp"
@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
         RON_LOG_ERROR("Failed to init arena_thtr");
         return 5;
     }
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     const char* thtr_path = get_theatre_path();
     if (!theatre.load_file(thtr_path, arena_thtr).is_ok() || !theatre.is_valid()) {
         RON_LOG_ERROR("Failed to load theatre: %s", thtr_path);

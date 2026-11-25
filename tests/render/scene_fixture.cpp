@@ -71,7 +71,7 @@ const char* get_shaders_dir() {
 }
 
 struct SceneDataFixture {
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     assets::TextureData tex26;
     TerrainSource source;
     HeightSampler sampler;
@@ -128,7 +128,7 @@ SceneDataFixture& fixture() {
 
 } // namespace
 
-const sim::TheatreData& test_theatre() {
+const assets::TheatreData& test_theatre() {
     return fixture().theatre;
 }
 

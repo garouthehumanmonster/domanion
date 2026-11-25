@@ -22,12 +22,12 @@ public:
 
     LightingSystem(const LightingSystem&) = delete;
     LightingSystem& operator=(const LightingSystem&) = delete;
-    LightingSystem(LightingSystem&&) noexcept = default;
-    LightingSystem& operator=(LightingSystem&&) noexcept = default;
+    LightingSystem(LightingSystem&&) = delete;
+    LightingSystem& operator=(LightingSystem&&) = delete;
 
     bool init(VramLedger& ledger, ShaderLibrary& shaders) noexcept;
     void update(const FrameUniforms& fu, const CameraRts& cam, u32 flags = LIGHT_FLAG_CSM | LIGHT_FLAG_TERRAIN_SHADOW) noexcept;
-    void render_shadows(EntityRenderer& entity_renderer, const ShaderLibrary& shaders);
+    void render_shadows(EntityRenderer& entity_renderer, const ShaderLibrary& shaders) noexcept;
 
     void bind(u32 height_tex_id = 0) const noexcept;
     void bind(const TerrainSource& terrain_source) const noexcept;

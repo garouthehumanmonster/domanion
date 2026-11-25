@@ -1,8 +1,8 @@
-#include "sim/theatre_data.hpp"
+#include "assets/theatre_data.hpp"
 #include <cstdio>
 #include <cstring>
 
-namespace ron::sim {
+namespace ron::assets {
 
 Result<void> TheatreData::init_from_blob(std::span<const u8> blob) noexcept {
     is_valid_ = false;
@@ -248,4 +248,4 @@ fx32 TheatreData::sample_height_fx32(fx32 x, fx32 z) const noexcept {
     return y;
 }
 
-} // namespace ron::sim
+} // namespace ron::assets

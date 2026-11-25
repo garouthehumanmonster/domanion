@@ -2,7 +2,7 @@
 #include "core/arena.hpp"
 #include "core/fixed_math.hpp"
 #include "core/fixed_geom.hpp"
-#include "sim/theatre_data.hpp"
+#include "assets/theatre_data.hpp"
 #include <vector>
 #include <queue>
 #include <cstdio>
@@ -35,7 +35,7 @@ RON_TEST(Theatre_LoadHeader) {
     MemoryArena arena;
     RON_CHECK(arena.init(MiB(32), MiB(1), "theatre_arena").is_ok());
 
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     const char* path = get_theatre_path();
     auto res = theatre.load_file(path, arena);
     RON_CHECK(res.is_ok());
@@ -62,16 +62,16 @@ RON_TEST(Theatre_HeightQuery) {
     MemoryArena arena;
     RON_CHECK(arena.init(MiB(32), MiB(1), "theatre_arena").is_ok());
 
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     const char* path = get_theatre_path();
     RON_CHECK(theatre.load_file(path, arena).is_ok());
 
     // 1. Query at all 8 start locations: must match plateau_hcode within +-0.01m (655 in fx32)
     for (const auto& s : theatre.starts()) {
-        fx32 sx = sim::TheatreData::q_to_fx32(s.x_q);
-        fx32 sz = sim::TheatreData::q_to_fx32(s.z_q);
+        fx32 sx = assets::TheatreData::q_to_fx32(s.x_q);
+        fx32 sz = assets::TheatreData::q_to_fx32(s.z_q);
         fx32 sampled = theatre.sample_height_fx32(sx, sz);
-        fx32 expected = sim::TheatreData::hcode_to_fx32(s.plateau_hcode);
+        fx32 expected = assets::TheatreData::hcode_to_fx32(s.plateau_hcode);
         fx32 diff = abs_fx(sampled - expected);
         RON_CHECK(diff.raw <= 655); // <= 0.01m
     }
@@ -97,7 +97,7 @@ RON_TEST(Theatre_SurfaceConsistency) {
     MemoryArena arena;
     RON_CHECK(arena.init(MiB(32), MiB(1), "theatre_arena").is_ok());
 
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     const char* path = get_theatre_path();
     RON_CHECK(theatre.load_file(path, arena).is_ok());
 
@@ -112,7 +112,7 @@ RON_TEST(Theatre_SurfaceConsistency) {
     for (u32 z = 0; z < logic_n; ++z) {
         for (u32 x = 0; x < logic_n; ++x) {
             u32 idx = z * logic_n + x;
-            sim::Surface s = static_cast<sim::Surface>(surf[idx]);
+            assets::Surface s = static_cast<assets::Surface>(surf[idx]);
             u8 sl = slope[idx];
 
             u64 sum_code = 0;
@@ -122,15 +122,15 @@ RON_TEST(Theatre_SurfaceConsistency) {
                 }
             }
             u16 mean_code = (u16)(sum_code / block_sq);
-            fx32 mean_h = sim::TheatreData::hcode_to_fx32(mean_code);
+            fx32 mean_h = assets::TheatreData::hcode_to_fx32(mean_code);
 
-            if (s == sim::Surface::DeepWater) {
+            if (s == assets::Surface::DeepWater) {
                 RON_CHECK(mean_h.raw <= -(8 << 16) + 655);
-            } else if (s == sim::Surface::ShallowWater) {
+            } else if (s == assets::Surface::ShallowWater) {
                 RON_CHECK(mean_h.raw <= -(49152) + 655); // -0.75m in Q16.16 is -49152
-            } else if (s == sim::Surface::Beach) {
+            } else if (s == assets::Surface::Beach) {
                 RON_CHECK(sl <= 12);
-            } else if (s == sim::Surface::Cliff) {
+            } else if (s == assets::Surface::Cliff) {
                 RON_CHECK(sl >= 40);
             }
         }
@@ -141,7 +141,7 @@ RON_TEST(Theatre_StartsPlateaus) {
     MemoryArena arena;
     RON_CHECK(arena.init(MiB(32), MiB(1), "theatre_arena").is_ok());
 
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     const char* path = get_theatre_path();
     RON_CHECK(theatre.load_file(path, arena).is_ok());
 
@@ -168,9 +168,9 @@ RON_TEST(Theatre_StartsPlateaus) {
 
     // 3. Within 60m of each start, logic cells have Surface == Land and height within +-0.05m
     for (const auto& s : starts) {
-        fx32 sx = sim::TheatreData::q_to_fx32(s.x_q);
-        fx32 sz = sim::TheatreData::q_to_fx32(s.z_q);
-        fx32 expected_h = sim::TheatreData::hcode_to_fx32(s.plateau_hcode);
+        fx32 sx = assets::TheatreData::q_to_fx32(s.x_q);
+        fx32 sz = assets::TheatreData::q_to_fx32(s.z_q);
+        fx32 expected_h = assets::TheatreData::hcode_to_fx32(s.plateau_hcode);
 
         i32 min_cx = ((s.x_q >> 4) - 60) / 8;
         i32 max_cx = ((s.x_q >> 4) + 60) / 8;
@@ -186,8 +186,8 @@ RON_TEST(Theatre_StartsPlateaus) {
                     Vec2fx p2{sx, sz};
                     fx32 dist = p1.distance(p2);
                     if (dist.raw <= (60 << 16)) {
-                        sim::Surface surf = theatre.surface_at_logic(cx, cz);
-                        RON_CHECK_EQ((u8)surf, (u8)sim::Surface::Land);
+                        assets::Surface surf = theatre.surface_at_logic(cx, cz);
+                        RON_CHECK_EQ((u8)surf, (u8)assets::Surface::Land);
                         fx32 h = theatre.sample_height_fx32(cell_x, cell_z);
                         RON_CHECK(abs_fx(h - expected_h).raw <= 3276); // <= 0.05m
                     }
@@ -201,7 +201,7 @@ RON_TEST(Theatre_ResourcesFair) {
     MemoryArena arena;
     RON_CHECK(arena.init(MiB(32), MiB(1), "theatre_arena").is_ok());
 
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     const char* path = get_theatre_path();
     RON_CHECK(theatre.load_file(path, arena).is_ok());
 
@@ -215,13 +215,13 @@ RON_TEST(Theatre_ResourcesFair) {
         u32 berries = 0, herd = 0, forest = 0, iron = 0, gold = 0, oil = 0, silicon = 0;
         for (const auto& r : res) {
             if (r.owner == slot) {
-                if (r.kind == (u8)sim::NodeKind::Berries) berries++;
-                else if (r.kind == (u8)sim::NodeKind::Herd) herd++;
-                else if (r.kind == (u8)sim::NodeKind::Forest) forest++;
-                else if (r.kind == (u8)sim::NodeKind::Iron) iron++;
-                else if (r.kind == (u8)sim::NodeKind::Gold) gold++;
-                else if (r.kind == (u8)sim::NodeKind::Oil) oil++;
-                else if (r.kind == (u8)sim::NodeKind::Silicon) silicon++;
+                if (r.kind == (u8)assets::NodeKind::Berries) berries++;
+                else if (r.kind == (u8)assets::NodeKind::Herd) herd++;
+                else if (r.kind == (u8)assets::NodeKind::Forest) forest++;
+                else if (r.kind == (u8)assets::NodeKind::Iron) iron++;
+                else if (r.kind == (u8)assets::NodeKind::Gold) gold++;
+                else if (r.kind == (u8)assets::NodeKind::Oil) oil++;
+                else if (r.kind == (u8)assets::NodeKind::Silicon) silicon++;
             }
         }
         RON_CHECK_EQ(berries, 3u);
@@ -253,7 +253,7 @@ RON_TEST(Theatre_ConnectivityLandings) {
     MemoryArena arena;
     RON_CHECK(arena.init(MiB(32), MiB(1), "theatre_arena").is_ok());
 
-    sim::TheatreData theatre;
+    assets::TheatreData theatre;
     const char* path = get_theatre_path();
     RON_CHECK(theatre.load_file(path, arena).is_ok());
 
@@ -282,8 +282,8 @@ RON_TEST(Theatre_ConnectivityLandings) {
             if (nx >= 0 && nx < (int)logic_n && nz >= 0 && nz < (int)logic_n) {
                 u32 nidx = nz * logic_n + nx;
                 if (!visited[nidx]) {
-                    sim::Surface surf = theatre.surface_at_logic(nx, nz);
-                    if (surf == sim::Surface::Beach || surf == sim::Surface::Land || surf == sim::Surface::Rough) {
+                    assets::Surface surf = theatre.surface_at_logic(nx, nz);
+                    if (surf == assets::Surface::Beach || surf == assets::Surface::Land || surf == assets::Surface::Rough) {
                         visited[nidx] = true;
                         q.push({(u32)nx, (u32)nz});
                     }

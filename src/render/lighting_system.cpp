@@ -93,7 +93,7 @@ void LightingSystem::bind(const TerrainRenderer& terrain) const noexcept {
     bind(terrain.height_tex().id());
 }
 
-void LightingSystem::render_shadows(EntityRenderer& entity_renderer, const ShaderLibrary& shaders) {
+void LightingSystem::render_shadows(EntityRenderer& entity_renderer, const ShaderLibrary& shaders) noexcept {
     u32 shadow_prog = shaders.program(ProgramId::ShadowEntity);
     if (shadow_prog == 0) return;
 

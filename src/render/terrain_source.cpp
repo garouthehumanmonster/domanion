@@ -1,5 +1,5 @@
 #include "render/terrain_source.hpp"
-#include "sim/theatre_data.hpp"
+#include "assets/theatre_data.hpp"
 #include "assets/texture_data.hpp"
 #include <vector>
 #include <cstring>
@@ -9,7 +9,7 @@ namespace ron::render {
 
 static std::vector<u16> s_aligned_height;
 
-bool terrain_source_from(const sim::TheatreData& theatre, TerrainSource& out) {
+bool terrain_source_from(const assets::TheatreData& theatre, TerrainSource& out) {
     if (!theatre.is_valid()) return false;
     auto h_grid = theatre.height_grid();
     u32 n = theatre.height_n();

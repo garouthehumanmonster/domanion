@@ -69,7 +69,6 @@ set(RON_SIM_SOURCES
     src/sim/command_bus.cpp
     src/sim/sim_world.cpp
     src/sim/game_db.cpp
-    src/sim/theatre_data.cpp
 )
 
 add_library(ron_sim STATIC ${RON_SIM_SOURCES})
@@ -82,6 +81,7 @@ target_include_directories(ron_sim PUBLIC
 target_compile_options(ron_sim PRIVATE
     -Wall -Wextra -Wpedantic -Wshadow -Werror=return-type
     -march=x86-64-v2 -fno-exceptions -fno-rtti -fno-strict-aliasing
+    -fwrapv -Werror=double-promotion -Werror=float-conversion -Werror=switch
     $<$<CONFIG:Debug>:-O0 -g3>
     $<$<NOT:$<CONFIG:Debug>>:-O3 -fomit-frame-pointer>
 )
@@ -91,12 +91,15 @@ target_compile_definitions(ron_sim PUBLIC
     $<$<NOT:$<CONFIG:Debug>>:NDEBUG RON_DEBUG=0>
 )
 
+target_compile_definitions(ron_sim PRIVATE RON_SIM_NO_FLOAT=1)
+
 target_link_libraries(ron_sim PUBLIC ron_core)
 
 # C++ target ron_assets (STATIC library containing src/assets/*.cpp)
 set(RON_ASSETS_SOURCES
     src/assets/model_data.cpp
     src/assets/texture_data.cpp
+    src/assets/theatre_data.cpp
 )
 
 add_library(ron_assets STATIC ${RON_ASSETS_SOURCES})
@@ -136,7 +139,7 @@ add_executable(ron_tests ${RON_TEST_SOURCES})
 
 target_compile_options(ron_tests PRIVATE
     -Wall -Wextra -Wpedantic -Wshadow -Werror=return-type
-    -march=x86-64-v2 -fno-exceptions -fno-rtti
+    -march=x86-64-v2 -fno-exceptions -fno-rtti -fno-strict-aliasing
     $<$<CONFIG:Debug>:-O0 -g3>
     $<$<NOT:$<CONFIG:Debug>>:-O3 -fomit-frame-pointer>
 )
@@ -172,6 +175,8 @@ add_subdirectory(third_party/SDL3 EXCLUDE_FROM_ALL)
 add_library(glad STATIC third_party/glad/src/gl.c)
 target_include_directories(glad SYSTEM PUBLIC third_party/glad/include)
 target_compile_options(glad PRIVATE -O3 -w)
+
+set(CMAKE_C_EXTENSIONS OFF)
 
 # Target ron_sdl_smoke
 add_executable(ron_sdl_smoke src/render/sdl_smoke.cpp)
@@ -252,7 +257,7 @@ target_compile_definitions(ron_render PUBLIC
     $<$<NOT:$<CONFIG:Debug>>:NDEBUG RON_DEBUG=0>
 )
 
-target_link_libraries(ron_render PUBLIC glad SDL3::SDL3-static ron_core ron_assets ron_sim)
+target_link_libraries(ron_render PUBLIC glad SDL3::SDL3-static ron_core ron_assets)
 if(WIN32)
     target_link_libraries(ron_render PUBLIC winmm imm32 setupapi version ole32 oleaut32 gdi32 user32 shell32 advapi32)
 endif()
@@ -299,7 +304,7 @@ target_include_directories(ron_render_tests PRIVATE
 
 target_compile_options(ron_render_tests PRIVATE
     -Wall -Wextra -Wpedantic -Wshadow -Werror=return-type
-    -march=x86-64-v2
+    -march=x86-64-v2 -fno-strict-aliasing
     $<$<CONFIG:Debug>:-O0 -g3>
     $<$<NOT:$<CONFIG:Debug>>:-O3 -fomit-frame-pointer>
 )
@@ -310,9 +315,12 @@ target_compile_definitions(ron_render_tests PRIVATE
     RON_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
-target_link_libraries(ron_render_tests PRIVATE ron_render glad SDL3::SDL3-static ron_core ron_assets ron_sim)
+target_link_libraries(ron_render_tests PRIVATE ron_render glad SDL3::SDL3-static ron_core ron_assets)
 if(WIN32)
     target_link_libraries(ron_render_tests PRIVATE winmm imm32 setupapi version ole32 oleaut32 gdi32 user32 shell32 advapi32)
+endif()
+if(MINGW)
+    target_link_options(ron_render_tests PRIVATE -Wl,--stack,16777216 -static -static-libgcc -static-libstdc++)
 endif()
 
 # C++ executable ron_view
@@ -325,7 +333,7 @@ target_include_directories(ron_view PRIVATE
 
 target_compile_options(ron_view PRIVATE
     -Wall -Wextra -Wpedantic -Wshadow -Werror=return-type
-    -march=x86-64-v2
+    -march=x86-64-v2 -fno-strict-aliasing
     $<$<CONFIG:Debug>:-O0 -g3>
     $<$<NOT:$<CONFIG:Debug>>:-O3 -fomit-frame-pointer>
 )
@@ -336,12 +344,12 @@ target_compile_definitions(ron_view PRIVATE
     RON_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
-target_link_libraries(ron_view PRIVATE ron_render glad SDL3::SDL3-static ron_core ron_assets ron_sim)
+target_link_libraries(ron_view PRIVATE ron_render glad SDL3::SDL3-static ron_core ron_assets)
 if(WIN32)
     target_link_libraries(ron_view PRIVATE winmm imm32 setupapi version ole32 oleaut32 gdi32 user32 shell32 advapi32)
 endif()
 if(MINGW)
-    target_link_options(ron_render_tests PRIVATE -Wl,--stack,16777216 -static -static-libgcc -static-libstdc++)
+    target_link_options(ron_view PRIVATE -Wl,--stack,16777216 -static -static-libgcc -static-libstdc++)
 endif()
 
 

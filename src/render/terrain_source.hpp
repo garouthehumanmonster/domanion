@@ -2,11 +2,8 @@
 
 #include "core/types.hpp"
 
-namespace ron::sim {
-class TheatreData;
-}
-
 namespace ron::assets {
+class TheatreData;
 class TextureData;
 }
 
@@ -20,7 +17,7 @@ struct TerrainSource {
     u32 biome_h{0};
 };
 
-bool terrain_source_from(const sim::TheatreData& theatre, TerrainSource& out);
+bool terrain_source_from(const assets::TheatreData& theatre, TerrainSource& out);
 
 struct TerrainTexLevel {
     const void* data{nullptr};

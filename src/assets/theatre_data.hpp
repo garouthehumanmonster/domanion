@@ -9,7 +9,7 @@
 #include <span>
 #include <string_view>
 
-namespace ron::sim {
+namespace ron::assets {
 
 enum class Surface : u8 {
     DeepWater = 0,
@@ -161,4 +161,4 @@ private:
     std::span<const TheatreLanding> landings_{};
 };
 
-} // namespace ron::sim
+} // namespace ron::assets

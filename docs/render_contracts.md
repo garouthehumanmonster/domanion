@@ -231,7 +231,7 @@ All graphical executables (`ron_view`, etc.) MUST call `RON_EXPORT_GPU_PREFERENC
 | `p3` | `vec4` | 304 | 16 | x=local_player, yzw=reserved |
 
 ### Depth Pass Contract Note
-Craters are cosmetic and are NOT evaluated in depth-only passes until Gate 13.
+Craters are cosmetic (`ovl_crater_albedo` / `ovl_crater_normal` applied in fragment lighting); Gate 13 entity shadow cascades (`ShadowEntity`) and 48-step terrain heightmap raymarch shadows evaluate terrain height without crater offsets.
 
 ## 18. Crater Formulas & Encoding
 - **Spatial Coverage**: 2048x2048 RGBA8 texture (`2m` texels over `4096m` world).
@@ -297,3 +297,52 @@ Craters are cosmetic and are NOT evaluated in depth-only passes until Gate 13.
    - Single `glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr, bucket_count, 0)`.
    - Drawn after terrain and before ocean plane.
 
+
+## 22. Lighting, CSM Shadows & PBR-Lite Specification (Gate 13)
+### Pipeline Bindings
+| Symbol | Type | Value | Target |
+|---|---|---|---|
+| `BIND_UBO_LIGHT` | UBO | 5 | `LightingUbo` struct block (368 B, std140) |
+| `TEX_SHADOW_MAP` | Texture 2DArrayShadow | 19 | 2048x2048x4 `D32F` (`VramCat::ShadowMaps`, `GL_COMPARE_REF_TO_TEXTURE`, `GL_GREATER`) |
+| `TEX_HEIGHT_LINEAR` | Texture 2D | 20 | Terrain heightmap bound with linear clamp sampler (`height_linear_sampler_`) |
+| `RON_SHADOW_CASCADES` | Constant | 4 | Cascade slice count |
+| `RON_TERRAIN_SHADOW_STEPS` | Constant | 48 | Heightfield shadow raymarch steps |
+| `RON_TERRAIN_SHADOW_REACH` | Constant | 1100.0 | Terrain raymarch max reach in meters |
+| `RON_TERRAIN_SHADOW_BIAS` | Constant | 0.5 | Terrain raymarch vertical bias in meters |
+
+### LightingUbo Layout (std140, 368 Bytes, 16-byte aligned)
+| Member | Type | Offset (Bytes) | Size (Bytes) | Description |
+|---|---|---|---|---|
+| `light_vp[4]` | `mat4[4]` | 0 | 256 | Column-major Reverse-Z cascade view-projection matrices (`SHADOW_NEAR=1.0m`, `SHADOW_DISTANCE=1500.0m`, `SPLIT_LAMBDA=0.80`) |
+| `splits` | `vec4` | 256 | 16 | Split distances `{z_1, z_2, z_3, z_4}` |
+| `texel` | `vec4` | 272 | 16 | World-space texel size `texel_world[0..3]` per cascade |
+| `inv_range` | `vec4` | 288 | 16 | `inv_range[0..3]` per cascade for Reverse-Z normal/depth bias |
+| `cam_fwd` | `vec4` | 304 | 16 | Camera forward `(xyz)`, `w = float(flags)` (`LIGHT_FLAG_CSM=1`, `LIGHT_FLAG_TERRAIN_SHADOW=2`) |
+| `ambient_sky` | `vec4` | 320 | 16 | Sky hemisphere RGB `{0.38, 0.52, 0.78}`, `w = AMBIENT_INTENSITY (0.55)` |
+| `ambient_ground` | `vec4` | 336 | 16 | Ground hemisphere RGB `{0.20, 0.18, 0.15}`, `w = 0.0` |
+| `shadow_p` | `vec4` | 352 | 16 | `{1.0 (pcf_radius), 48.0, 1100.0, 0.0}` |
+
+### Lighting & Shadow Contracts
+- **Sun Vector Convention**: `u_sun_dir.xyz` points **toward the sun**; `sun_rgb = u_sun_color.rgb * u_sun_dir.w`.
+- **Reverse-Z Shadow Pass (`LightingSystem::render_shadows`)**: Renders `ShadowEntity` per cascade layer into `shadow_fbo_[0..3]`, clearing `D32F` to `0.0f`. Evaluated with 3x3 PCF + `smoothstep` fade across outer 15% of cascade 3, multiplied by 48-step terrain heightmap raymarch visibility under `RON_LIT`.
+- **PBR-Lite Shading (`pbr_ref` / `pbr_lite.glsl`)**: GGX normal distribution (`ggx_d`), Smith visibility (`smith_vis`), Schlick Fresnel (`fresnel_schlick`), hemisphere ambient + sun direct visibility. Non-movable `LightingSystem` owns `shadow_fbo_[4]` and `height_linear_sampler_`.
+
+## 23. World Marks Specification (Gate 13)
+### Pipeline Bindings
+| Symbol | Type | Value | Target |
+|---|---|---|---|
+| `BIND_UBO_MARKS` | UBO | 6 | `MarksUbo` struct block (832 B, std140) |
+| `BIND_SSBO_ICONS` | SSBO | 11 | `IconGpu` buffer (32 B/entry) |
+| `BIND_SSBO_BARS` | SSBO | 12 | `BarGpu` buffer (32 B/entry) |
+| `BIND_SSBO_MARK_CMDS` | SSBO | 13 | `DrawArraysIndirectCommand` buffer (16 B) |
+| `BIND_SSBO_MODEL_MARKS` | SSBO | 14 | `ModelMarkGpu` lookup table (8 B/entry, 71 models -> 54 marked, 17 `0xFFFF`) |
+| `TEX_MSDF` | Texture 2D | 21 | 1024x512 RGBA8 MSDF atlas (32 icon cells of 64x64 px at `y in [384, 512)`, `RANGE_PX=4.0`) |
+
+### Pass Ordering & Blending
+- Drawn into the LDR target immediately **after** Tonemap and **before** Minimap/UI (`glDisable(GL_DEPTH_TEST)`, `glDepthMask(GL_FALSE)`, `GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA`), writing display-space RGB directly with `GL_FRAMEBUFFER_SRGB` disabled. Contracts: `docs/gate13_contract_notes.md`.
+
+## 24. Gate 13 Verification Tests (`ron_render_tests`)
+1. `Lit_Layout`, `Cascade_Splits`, `Cascade_Fit`, `Shadow_Ref`, `Pbr_Ref`, `Marks_Math` (CPU reference & UBO layout).
+2. `Lit_ShadowResources`, `Ui_AtlasUpload`, `Marks_Resources` (GPU resources & `VramLedger`).
+3. `Shadow_TerrainGpu`, `Pbr_Gpu`, `Shadow_CascadeDepth` (GPU math parity & cascade depth write).
+4. `Lit_Programs`, `Shadow_Entity_Cascades`, `Shadow_NoAcne`, `Shadow_Terrain_Scene`, `Shadow_FlagsNeutral` (full lit scene integration).

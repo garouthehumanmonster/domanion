@@ -2,6 +2,7 @@
 
 #include "types.hpp"
 #include "assert_log.hpp"
+#include <bit>
 #include <compare>
 #include <algorithm>
 
@@ -51,18 +52,20 @@ RON_FORCE_INLINE constexpr u32 isqrt_u64(u64 n) noexcept {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-RON_FORCE_INLINE u64 div128_by_64(u128 n, u64 divisor) noexcept {
-    const u64 hi = static_cast<u64>(n >> 64);
-    const u64 lo = static_cast<u64>(n);
-    if (hi < divisor) {
-        u64 quot, rem;
-        asm("divq %4" : "=a"(quot), "=d"(rem) : "0"(lo), "1"(hi), "rm"(divisor));
-        return quot;
+RON_FORCE_INLINE constexpr u64 div128_by_64(u128 n, u64 divisor) noexcept {
+    if !consteval {
+        const u64 hi = static_cast<u64>(n >> 64);
+        const u64 lo = static_cast<u64>(n);
+        if (hi < divisor) {
+            u64 quot, rem;
+            asm("divq %4" : "=a"(quot), "=d"(rem) : "0"(lo), "1"(hi), "rm"(divisor));
+            return quot;
+        }
     }
     return static_cast<u64>(n / divisor);
 }
 #else
-RON_FORCE_INLINE u64 div128_by_64(u128 n, u64 divisor) noexcept {
+RON_FORCE_INLINE constexpr u64 div128_by_64(u128 n, u64 divisor) noexcept {
     return static_cast<u64>(n / divisor);
 }
 #endif
@@ -78,15 +81,23 @@ RON_FORCE_INLINE constexpr u64 isqrt_u128(u128 n) noexcept {
     const int k = 128 - lz;
     const int s = (k - 62) & ~1;
     const u64 n64 = static_cast<u64>(n >> s);
-    const u64 x0 = static_cast<u64>(isqrt_u64(n64)) << (s / 2);
+    u128 x = static_cast<u128>(isqrt_u64(n64)) << (s / 2);
 
-    u64 x1 = (x0 + div128_by_64(n, x0)) >> 1;
-    x1 = (x1 + div128_by_64(n, x1)) >> 1;
+    auto div_n = [n, hi](u128 d) constexpr noexcept -> u128 {
+        if !consteval {
+            if (d <= 0xFFFF'FFFF'FFFF'FFFFULL && hi < static_cast<u64>(d)) {
+                return static_cast<u128>(div128_by_64(n, static_cast<u64>(d)));
+            }
+        }
+        return n / d;
+    };
 
-    if (x1 > div128_by_64(n, x1)) {
-        --x1;
+    x = (x + div_n(x)) >> 1;
+    x = (x + div_n(x)) >> 1;
+    while (x > div_n(x)) {
+        --x;
     }
-    return x1;
+    return static_cast<u64>(x);
 }
 
 // -------------------------------------------------------------------------
@@ -156,12 +167,16 @@ struct alignas(4) fx32 {
         return raw >> 16;
     }
 
+#if !defined(RON_SIM_NO_FLOAT)
     constexpr f32 to_render_f32() const noexcept {
         return static_cast<f32>(raw) * (1.0f / 65536.0f);
     }
+#endif
 
     constexpr fx32 operator+() const noexcept { return *this; }
-    constexpr fx32 operator-() const noexcept { return fx32{-raw}; }
+    constexpr fx32 operator-() const noexcept {
+        return (raw <= RAW_MIN) ? max_val() : fx32{static_cast<i32>(0u - static_cast<u32>(raw))};
+    }
 
     constexpr fx32 operator+(fx32 b) const noexcept {
         return from_raw(static_cast<i64>(raw) + b.raw);
@@ -210,7 +225,7 @@ struct alignas(4) fx32 {
 static_assert(sizeof(fx32) == 4 && std::is_trivially_copyable_v<fx32> && std::has_unique_object_representations_v<fx32>);
 
 constexpr fx32 abs_fx(fx32 a) noexcept {
-    return fx32{a.raw < 0 ? -a.raw : a.raw};
+    return (a.raw < 0) ? -a : a;
 }
 
 constexpr fx32 min_fx(fx32 a, fx32 b) noexcept {
@@ -266,9 +281,9 @@ struct alignas(8) fx64 {
 
     constexpr fx32 to_fx32_sat() const noexcept {
         const bool neg = raw < 0;
-        const u128 u = neg ? static_cast<u128>(-raw) : static_cast<u128>(raw);
-        const u128 rounded = (u + 0x8000ULL) >> 16;
-        const i128 r = neg ? -static_cast<i128>(rounded) : static_cast<i128>(rounded);
+        const u64 mag = neg ? (0ULL - static_cast<u64>(raw)) : static_cast<u64>(raw);
+        const u64 rounded = (mag + 0x8000ULL) >> 16;
+        const i64 r = neg ? -static_cast<i64>(rounded) : static_cast<i64>(rounded);
         return fx32::from_raw(r);
     }
 
@@ -277,7 +292,9 @@ struct alignas(8) fx64 {
     }
 
     constexpr fx64 operator+() const noexcept { return *this; }
-    constexpr fx64 operator-() const noexcept { return fx64{-raw}; }
+    constexpr fx64 operator-() const noexcept {
+        return (raw <= RAW_MIN) ? max_val() : fx64{static_cast<i64>(0ULL - static_cast<u64>(raw))};
+    }
 
     constexpr fx64 operator+(fx64 b) const noexcept {
         return from_raw(static_cast<i128>(raw) + b.raw);
@@ -299,9 +316,9 @@ struct alignas(8) fx64 {
 
     constexpr fx64 operator*(fx64 b) const noexcept {
         const bool neg = (raw < 0) ^ (b.raw < 0);
-        const u128 ua = (raw < 0) ? -raw : raw;
-        const u128 ub = (b.raw < 0) ? -b.raw : b.raw;
-        u128 prod = ua * ub;
+        const u64 ua = (raw < 0) ? (0ULL - static_cast<u64>(raw)) : static_cast<u64>(raw);
+        const u64 ub = (b.raw < 0) ? (0ULL - static_cast<u64>(b.raw)) : static_cast<u64>(b.raw);
+        u128 prod = static_cast<u128>(ua) * static_cast<u128>(ub);
         prod = (prod + 0x8000'0000ULL) >> 32;
         const i128 res = neg ? -static_cast<i128>(prod) : static_cast<i128>(prod);
         return from_raw(res);
@@ -319,8 +336,8 @@ struct alignas(8) fx64 {
             return zero();
         }
         const bool neg = (a.raw < 0) ^ (b.raw < 0);
-        const u128 ua = (a.raw < 0) ? -a.raw : a.raw;
-        const u128 ub = (b.raw < 0) ? -b.raw : b.raw;
+        const u128 ua = (a.raw < 0) ? (0ULL - static_cast<u64>(a.raw)) : static_cast<u64>(a.raw);
+        const u128 ub = (b.raw < 0) ? (0ULL - static_cast<u64>(b.raw)) : static_cast<u64>(b.raw);
         const u128 num = (ua << 32) + (ub >> 1);
         const u128 q = num / ub;
         const i128 res = neg ? -static_cast<i128>(q) : static_cast<i128>(q);
@@ -344,7 +361,7 @@ struct alignas(8) fx64 {
 static_assert(sizeof(fx64) == 8 && std::is_trivially_copyable_v<fx64> && std::has_unique_object_representations_v<fx64>);
 
 constexpr fx64 abs_fx(fx64 a) noexcept {
-    return fx64{a.raw < 0 ? -a.raw : a.raw};
+    return (a.raw < 0) ? -a : a;
 }
 
 constexpr fx64 min_fx(fx64 a, fx64 b) noexcept {
@@ -440,14 +457,18 @@ constexpr i16 shortest_delta_bam(Angle16 from, Angle16 to) noexcept {
 }
 
 constexpr Angle16 turn_towards_bam(Angle16 current, Angle16 target, u16 max_step_bam) noexcept {
-    const i16 delta = shortest_delta_bam(current, target);
-    if (delta > static_cast<i16>(max_step_bam)) {
-        return current + Angle16{max_step_bam};
-    } else if (delta < -static_cast<i16>(max_step_bam)) {
-        return current - Angle16{max_step_bam};
-    } else {
+    if (max_step_bam >= 32768u) {
         return target;
     }
+    const i32 delta = static_cast<i32>(shortest_delta_bam(current, target));
+    const i32 step = static_cast<i32>(max_step_bam);
+    if (delta > step) {
+        return current + Angle16{max_step_bam};
+    }
+    if (delta < -step) {
+        return current - Angle16{max_step_bam};
+    }
+    return target;
 }
 
 // 1026-entry quarter wave compile-time LUT via pure __int128 Taylor series (NO <cmath>!)
@@ -531,20 +552,21 @@ RON_FORCE_INLINE Angle16 atan2_bam(i64 z_sin, i64 x_cos) noexcept {
         return (x_cos > 0) ? Angle16::DEG_0 : Angle16::DEG_180;
     }
 
-    const i64 ax = (x_cos < 0) ? -x_cos : x_cos;
-    const i64 az = (z_sin < 0) ? -z_sin : z_sin;
+    const u64 ax = (x_cos < 0) ? (0ULL - static_cast<u64>(x_cos)) : static_cast<u64>(x_cos);
+    const u64 az = (z_sin < 0) ? (0ULL - static_cast<u64>(z_sin)) : static_cast<u64>(z_sin);
 
-    i64 cur_x = ax;
-    i64 cur_z = az;
+    i64 cur_x = 0;
+    i64 cur_z = 0;
 
-    const u64 m = static_cast<u64>((cur_x > cur_z) ? cur_x : cur_z);
+    const u64 m = (ax > az) ? ax : az;
     if (m > (1ULL << 56)) {
-        cur_x >>= 8;
-        cur_z >>= 8;
+        const int rshift = std::bit_width(m) - 56;
+        cur_x = static_cast<i64>(ax >> rshift);
+        cur_z = static_cast<i64>(az >> rshift);
     } else {
         const int s = std::clamp(47 - std::bit_width(m), 0, 47);
-        cur_x <<= s;
-        cur_z <<= s;
+        cur_x = static_cast<i64>(ax << s);
+        cur_z = static_cast<i64>(az << s);
     }
 
     i32 acc = 0;

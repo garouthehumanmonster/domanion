@@ -96,7 +96,10 @@ RON_TEST(FixedSqrt_ContinentalDistancesAndMicroVectors) {
     // distance({0, 0}, {4096, 4096}) equals 5792.6187m within <= 2 ULP (379,625,062)
     const Vec2fx origin{fx32::from_int(0), fx32::from_int(0)};
     const Vec2fx corner{fx32::from_int(4096), fx32::from_int(4096)};
+    const fx64 continental_dist_sq = origin.distance_sq(corner);
+    RON_EXPECT_EQ(continental_dist_sq.raw, (1LL << 57));
     const fx32 continental_dist = origin.distance(corner);
+    RON_EXPECT_TRUE(continental_dist.raw > fx32::lit(181.02).raw);
 
     constexpr i32 EXPECTED_RAW = 379625062; // 5792.61875m in Q16.16
     const i32 diff = (continental_dist.raw > EXPECTED_RAW) ? (continental_dist.raw - EXPECTED_RAW) : (EXPECTED_RAW - continental_dist.raw);
@@ -353,4 +356,63 @@ RON_TEST(Determinism_MillionOpHashAndBenchmark) {
 #endif
 
     arena.shutdown();
+}
+
+// -------------------------------------------------------------------------
+// 8. FixedMath_RegressionIsqrtMinUbAndTurnBounds
+// -------------------------------------------------------------------------
+RON_TEST(FixedMath_RegressionIsqrtMinUbAndTurnBounds) {
+    static_assert(isqrt_u128((static_cast<u128>(0xFFFF'FFFF'FFFF'FFFFULL) << 64) | 0xFFFF'FFFF'FFFF'FFFFULL) == 0xFFFF'FFFF'FFFF'FFFFULL);
+    static_assert(isqrt_u128(static_cast<u128>(1) << 126) == (1ULL << 63));
+    static_assert(isqrt_u128((static_cast<u128>(1) << 126) - 1) == ((1ULL << 63) - 1));
+
+    constexpr u128 u128_max = (static_cast<u128>(0xFFFF'FFFF'FFFF'FFFFULL) << 64) | 0xFFFF'FFFF'FFFF'FFFFULL;
+    constexpr u128 pow2_126 = static_cast<u128>(1) << 126;
+    constexpr u128 max_u64_sq = static_cast<u128>(0xFFFF'FFFF'FFFF'FFFFULL) * static_cast<u128>(0xFFFF'FFFF'FFFF'FFFFULL);
+    struct SqrtCase {
+        u128 in;
+        u64 expected;
+    };
+    const SqrtCase cases[] = {
+        {u128_max, 0xFFFF'FFFF'FFFF'FFFFULL},
+        {pow2_126, 1ULL << 63},
+        {pow2_126 - 1, (1ULL << 63) - 1},
+        {max_u64_sq, 0xFFFF'FFFF'FFFF'FFFFULL},
+        {max_u64_sq - 1, 0xFFFF'FFFF'FFFF'FFFEULL},
+    };
+    for (usize i = 0; i < 5; ++i) {
+        const volatile usize idx = i;
+        RON_EXPECT_EQ(isqrt_u128(cases[idx].in), cases[idx].expected);
+    }
+
+    constexpr fx32 min32{INT32_MIN};
+    static_assert((-min32).raw == fx32::RAW_MAX);
+    static_assert(abs_fx(min32).raw == fx32::RAW_MAX);
+    RON_EXPECT_EQ((-min32).raw, fx32::max_val().raw);
+    RON_EXPECT_EQ(abs_fx(min32).raw, fx32::max_val().raw);
+
+    constexpr fx64 min64{INT64_MIN};
+    static_assert((-min64).raw == fx64::RAW_MAX);
+    static_assert(abs_fx(min64).raw == fx64::RAW_MAX);
+    static_assert(min64.to_fx32_sat().raw == fx32::RAW_MIN);
+    static_assert((min64 * fx64::zero()).raw == 0);
+    static_assert(fx64::div_sat(min64, fx64::one()).raw == fx64::RAW_MIN);
+    RON_EXPECT_EQ((-min64).raw, fx64::max_val().raw);
+    RON_EXPECT_EQ(abs_fx(min64).raw, fx64::max_val().raw);
+    RON_EXPECT_EQ(min64.to_fx32_sat().raw, fx32::min_val().raw);
+    RON_EXPECT_EQ((min64 * fx64::zero()).raw, fx64::zero().raw);
+    RON_EXPECT_EQ(fx64::div_sat(min64, fx64::one()).raw, fx64::min_val().raw);
+
+    RON_EXPECT_EQ(atan2_bam(INT64_MIN, i64{0}).raw, Angle16::DEG_270.raw);
+    RON_EXPECT_EQ(atan2_bam(i64{0}, INT64_MIN).raw, Angle16::DEG_180.raw);
+    const Angle16 diag_min = atan2_bam(INT64_MIN, INT64_MIN);
+    const i16 diag_err = shortest_delta_bam(diag_min, Angle16{40960});
+    RON_EXPECT_TRUE(diag_err >= -2 && diag_err <= 2);
+
+    RON_EXPECT_EQ(turn_towards_bam(Angle16{0}, Angle16{32768}, 40000).raw, 32768U);
+    RON_EXPECT_EQ(turn_towards_bam(Angle16{0}, Angle16{32768}, 32768).raw, 32768U);
+    RON_EXPECT_EQ(turn_towards_bam(Angle16{0}, Angle16{16384}, 40000).raw, 16384U);
+    RON_EXPECT_EQ(turn_towards_bam(Angle16{0}, Angle16{49152}, 40000).raw, 49152U);
+    RON_EXPECT_EQ(turn_towards_bam(Angle16{0}, Angle16{1000}, 500).raw, 500U);
+    RON_EXPECT_EQ(turn_towards_bam(Angle16{0}, Angle16{64536}, 500).raw, 65036U);
 }

@@ -31,6 +31,7 @@ struct RON_CACHE_ALIGN EntityStore {
     // Metadata
     u32 active_count{0};
     u32 free_top{0};
+    u8  pad_meta[56]{};
 
     // Sparse Indirection Arrays
     u32 sparse_to_dense[MAX_ENTITIES];
@@ -82,5 +83,7 @@ struct RON_CACHE_ALIGN EntityStore {
 };
 
 static_assert(std::is_trivially_copyable_v<EntityStore>);
+static_assert(std::has_unique_object_representations_v<EntityStore>);
+static_assert(sizeof(EntityStore) % CACHE_LINE_BYTES == 0);
 
 } // namespace ron

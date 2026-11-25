@@ -20,6 +20,16 @@ inline usize g_test_count = 0;
 inline const char* g_current_test = nullptr;
 inline usize g_assert_failures = 0;
 
+u64 heap_alloc_count() noexcept;
+int no_heap_alloc_depth() noexcept;
+
+struct ScopedNoHeapAlloc {
+    ScopedNoHeapAlloc() noexcept;
+    ~ScopedNoHeapAlloc() noexcept;
+    ScopedNoHeapAlloc(const ScopedNoHeapAlloc&) = delete;
+    ScopedNoHeapAlloc& operator=(const ScopedNoHeapAlloc&) = delete;
+};
+
 inline void register_test(const char* name, TestFn fn) noexcept {
     if (g_test_count < MAX_TESTS) {
         g_tests[g_test_count++] = TestCase{name, fn};

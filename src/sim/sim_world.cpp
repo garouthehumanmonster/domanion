@@ -260,6 +260,7 @@ Result<void> SimWorld::load_snapshot_lz4(std::span<const u8> compressed_snapshot
     }
 
     std::memcpy(state_, loaded, sizeof(SimState));
+    cmd_bus_.reset_for_snapshot();
     return Result<void>::ok();
 }
 

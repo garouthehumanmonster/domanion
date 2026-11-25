@@ -15,6 +15,7 @@
 #include "sim/sim_world.hpp"
 
 #include <algorithm>
+#include <new>
 
 using namespace ron;
 
@@ -331,8 +332,14 @@ RON_TEST(SimWorld_1WorkerVs8Workers16384EntitiesBitExact) {
             RON_ALWAYS_ASSERT(world.command_bus().enqueue(cmd).is_ok(), "enqueue failed");
         }
 
-        for (u32 t = 0; t < TICKS; ++t) {
-            world.step_tick(js);
+        {
+            ron::test::ScopedNoHeapAlloc no_alloc_guard;
+            const u64 allocs_before = ron::test::heap_alloc_count();
+            for (u32 t = 0; t < TICKS; ++t) {
+                world.step_tick(js);
+            }
+            RON_ALWAYS_ASSERT(ron::test::heap_alloc_count() == allocs_before,
+                              "Heap allocation occurred during SimWorld::step_tick");
         }
 
         const u64 hash = world.compute_state_hash();
@@ -441,18 +448,46 @@ RON_TEST(SimWorld_SnapshotSaveLoadMidMatchForkEquality) {
     }
     const u64 final_hash_a = worldA.compute_state_hash();
 
-    // Initialize brand-new worldB, load snapshot, apply same tick 60 & 75 commands
+    // Initialize brand-new worldB, pollute CommandBus with stale history + pending commands,
+    // then load snapshot and verify CommandBus resets cleanly before applying post-snapshot commands.
     SimWorld worldB;
     RON_EXPECT_TRUE(worldB.init(mem.match, SEED).is_ok());
+
+    SimCommand stale_past{
+        .execute_tick = 0,
+        .target_xz = Vec2fx{fx32::from_int(123), fx32::from_int(456)},
+        .param_id = 7,
+        .player_id = 2,
+        .type = CommandType::SpawnEntity
+    };
+    RON_EXPECT_TRUE(worldB.command_bus().enqueue(stale_past).is_ok());
+    worldB.step_tick(js);
+
+    SimCommand stale_future{
+        .execute_tick = 65,
+        .target_xz = Vec2fx{fx32::from_int(789), fx32::from_int(321)},
+        .param_id = 9,
+        .player_id = 4,
+        .type = CommandType::SpawnEntity
+    };
+    RON_EXPECT_TRUE(worldB.command_bus().enqueue(stale_future).is_ok());
+    RON_EXPECT_EQ(worldB.command_bus().pending_count(), 1u);
+    RON_EXPECT_EQ(worldB.command_bus().history_count(), 1u);
+
     RON_EXPECT_TRUE(worldB.load_snapshot_lz4(snapshot, mem.render_staging).is_ok());
     RON_EXPECT_EQ(worldB.state().current_tick, 50u);
+    RON_EXPECT_EQ(worldB.command_bus().pending_count(), 0u);
+    RON_EXPECT_EQ(worldB.command_bus().history_count(), 0u);
 
     RON_EXPECT_TRUE(worldB.command_bus().enqueue(cmd60).is_ok());
     RON_EXPECT_TRUE(worldB.command_bus().enqueue(cmd75).is_ok());
 
     // Run worldB to tick 100
-    for (u32 t = 50; t < 100; ++t) {
-        worldB.step_tick(js);
+    {
+        ron::test::ScopedNoHeapAlloc no_alloc_guard;
+        for (u32 t = 50; t < 100; ++t) {
+            worldB.step_tick(js);
+        }
     }
     const u64 final_hash_b = worldB.compute_state_hash();
 
@@ -609,20 +644,29 @@ RON_TEST(SimWorld_RenderInterpolationAndPerformanceBudget) {
         RON_ALWAYS_ASSERT(world.command_bus().enqueue(mcmd).is_ok(), "bench enqueue failed");
     }
 
-    // Warm-up 20 ticks
-    for (u32 t = 0; t < 20; ++t) {
-        world.step_tick(js);
-    }
-
-    // Benchmark 200 consecutive ticks
     constexpr u32 BENCH_TICKS = 200;
     f64 tick_ms[BENCH_TICKS];
-    for (u32 t = 0; t < BENCH_TICKS; ++t) {
-        const u64 t0 = clock_now_ns();
-        world.step_tick(js);
-        const u64 t1 = clock_now_ns();
-        tick_ms[t] = clock_ns_to_ms(t1 - t0);
+    {
+        ron::test::ScopedNoHeapAlloc no_alloc_guard;
+        const u64 allocs_before = ron::test::heap_alloc_count();
+        RON_EXPECT_EQ(ron::test::no_heap_alloc_depth(), 1);
+
+        // Warm-up 20 ticks
+        for (u32 t = 0; t < 20; ++t) {
+            world.step_tick(js);
+        }
+
+        // Benchmark 200 consecutive ticks
+        for (u32 t = 0; t < BENCH_TICKS; ++t) {
+            const u64 t0 = clock_now_ns();
+            world.step_tick(js);
+            const u64 t1 = clock_now_ns();
+            tick_ms[t] = clock_ns_to_ms(t1 - t0);
+        }
+
+        RON_EXPECT_EQ(ron::test::heap_alloc_count(), allocs_before);
     }
+    RON_EXPECT_EQ(ron::test::no_heap_alloc_depth(), 0);
     std::sort(tick_ms, tick_ms + BENCH_TICKS);
     const f64 p50 = tick_ms[BENCH_TICKS / 2];
     const f64 p95 = tick_ms[static_cast<usize>(BENCH_TICKS * 0.95)];
@@ -637,4 +681,73 @@ RON_TEST(SimWorld_RenderInterpolationAndPerformanceBudget) {
 
     js.shutdown();
     mem.shutdown_all();
+}
+
+// -------------------------------------------------------------------------
+// 8. SimWorld_LayoutAndZeroHeapAllocHook
+// -------------------------------------------------------------------------
+RON_TEST(SimWorld_LayoutAndZeroHeapAllocHook) {
+    static_assert(std::has_unique_object_representations_v<EntityStore>);
+    static_assert(std::has_unique_object_representations_v<SimState>);
+    static_assert(sizeof(EntityStore) % CACHE_LINE_BYTES == 0);
+    static_assert(sizeof(SimState) % CACHE_LINE_BYTES == 0);
+    static_assert(offsetof(SimState, entities) == CACHE_LINE_BYTES);
+
+    std::printf("Layout proof: sizeof(EntityStore)=%zu, sizeof(SimState)=%zu, offsetof(entities)=%zu\n",
+                sizeof(EntityStore), sizeof(SimState), offsetof(SimState, entities));
+
+    RON_EXPECT_EQ(ron::test::no_heap_alloc_depth(), 0);
+
+    // Verify global operator new/delete overrides are active outside ScopedNoHeapAlloc
+    const u64 before = ron::test::heap_alloc_count();
+    void* raw_p = ::operator new(64);
+    RON_EXPECT_TRUE(raw_p != nullptr);
+    ::operator delete(raw_p);
+
+    void* aligned_p = ::operator new(128, std::align_val_t{64});
+    RON_EXPECT_TRUE(aligned_p != nullptr);
+    RON_EXPECT_EQ(reinterpret_cast<uintptr_t>(aligned_p) % 64, 0u);
+    ::operator delete(aligned_p, std::align_val_t{64});
+    RON_EXPECT_EQ(ron::test::heap_alloc_count(), before + 2);
+
+    // Verify ScopedNoHeapAlloc depth nesting and zero-alloc arena + multi-worker tick execution
+    {
+        ron::test::ScopedNoHeapAlloc outer_guard;
+        RON_EXPECT_EQ(ron::test::no_heap_alloc_depth(), 1);
+        {
+            ron::test::ScopedNoHeapAlloc inner_guard;
+            RON_EXPECT_EQ(ron::test::no_heap_alloc_depth(), 2);
+
+            EngineMemory mem;
+            RON_EXPECT_TRUE(mem.init_all(4).is_ok());
+
+            JobSystem js;
+            RON_EXPECT_TRUE(js.init(4, &mem).is_ok());
+
+            SimWorld world;
+            RON_EXPECT_TRUE(world.init(mem.match, 0xCAFEBABEULL).is_ok());
+
+            for (u32 i = 0; i < 64; ++i) {
+                SimCommand cmd{
+                    .execute_tick = i % 10,
+                    .target_xz = Vec2fx{fx32::from_int(100 + static_cast<i32>(i)), fx32::from_int(200)},
+                    .param_id = 1,
+                    .player_id = static_cast<u8>(i % 4),
+                    .type = CommandType::SpawnEntity
+                };
+                RON_EXPECT_TRUE(world.command_bus().enqueue(cmd).is_ok());
+            }
+
+            const u64 allocs_before_ticks = ron::test::heap_alloc_count();
+            for (u32 t = 0; t < 20; ++t) {
+                world.step_tick(js);
+            }
+            RON_EXPECT_EQ(ron::test::heap_alloc_count(), allocs_before_ticks);
+
+            js.shutdown();
+            mem.shutdown_all();
+        }
+        RON_EXPECT_EQ(ron::test::no_heap_alloc_depth(), 1);
+    }
+    RON_EXPECT_EQ(ron::test::no_heap_alloc_depth(), 0);
 }

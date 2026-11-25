@@ -81,6 +81,7 @@ public:
     CommandBus() noexcept = default;
 
     Result<void> init(MemoryArena& match_arena) noexcept;
+    void reset_for_snapshot() noexcept;
 
     Result<void> enqueue(const SimCommand& cmd) noexcept;
     std::span<const SimCommand> extract_sorted_for_tick(u32 tick, MemoryArena& scratch) noexcept;

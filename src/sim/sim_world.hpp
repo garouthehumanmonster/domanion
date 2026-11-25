@@ -26,6 +26,8 @@ struct RON_CACHE_ALIGN SimState {
 };
 
 static_assert(std::is_trivially_copyable_v<SimState>);
+static_assert(std::has_unique_object_representations_v<SimState>);
+static_assert(offsetof(SimState, entities) % CACHE_LINE_BYTES == 0);
 
 // -------------------------------------------------------------------------
 // SimWorld: 20 Hz Deterministic Simulation Manager

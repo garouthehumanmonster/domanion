@@ -16,6 +16,12 @@ Result<void> CommandBus::init(MemoryArena& match_arena) noexcept {
     return Result<void>::ok();
 }
 
+void CommandBus::reset_for_snapshot() noexcept {
+    pending_count_ = 0;
+    history_count_ = 0;
+    next_sequence_id_ = 0;
+}
+
 Result<void> CommandBus::enqueue(const SimCommand& cmd) noexcept {
     if (pending_count_ >= MAX_PENDING_COMMANDS) {
         return Result<void>::err(ErrorCode::OutOfMemory);

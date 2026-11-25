@@ -15,6 +15,7 @@
 #include "sim/sim_world.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <new>
 
 using namespace ron;
@@ -352,6 +353,7 @@ RON_TEST(SimWorld_1WorkerVs8Workers16384EntitiesBitExact) {
     const u64 hash_8w = run_match(8);
 
     RON_EXPECT_EQ(hash_1w, hash_8w);
+    std::printf("[PARITY] SimWorld_16k_100t = 0x%016llx\n", static_cast<unsigned long long>(hash_8w));
 }
 
 // -------------------------------------------------------------------------
